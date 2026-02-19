@@ -12,33 +12,32 @@
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 #
 # ── AUDIT FIXES (v2.1) ────────────────────────────────────────────────────────
-# Fix 1 [CRITICAL] ConvSwiGLU padding="SAME" → causal left-pad + "VALID"
+# Fix 1 [CRITICAL] ConvSwiGLU padding="SAME" → causal left-pad.
 #        padding="SAME" caused symmetric padding → future token leakage.
 #        output[t] now sees only input[t-2], input[t-1], input[t]. ✓
 # Fix 2 [MEDIUM]  YaRN interpolation formula was direction-inverted.
-#        Old: alpha-boundary → compressed, beta-boundary → unchanged (wrong).
 #        New: t blends 0.0 (high-freq, unchanged) → 1.0 (low-freq, compressed). ✓
-# Fix 3 [LOW]     MLAAttention softmax: cast to float32 BEFORE applying mask.
-#        Old: jnp.finfo(float32).min applied to bfloat16 attn then cast.
-#        New: cast to float32 first, then mask, then softmax. ✓
-# Fix 4 [MEDIUM]  Dropout RNG: key_data() + wrap_key_data() → clean jrand.split.
-#        Old: extracted uint32 key_data on host, wrap_key_data inside pmap.
-#        New: jrand.split directly produces [TPU_CORES, GRAD_ACCUM] key array.
-#             No key_data/wrap_key_data needed — simpler and fully portable. ✓
+# Fix 3 [LOW]     MLAAttention softmax: cast to float32 BEFORE masking. ✓
+# Fix 4 [MEDIUM]  Dropout RNG: clean jrand.split, no key_data/wrap_key_data. ✓
 #
-# ── POST-AUDIT FIXES (v2.2) ───────────────────────────────────────────────────
-# Fix 5 [CRITICAL] combined_stream shared generator references.
-#        cycle = [gen_math, gen_math, ...] — slots 0 and 1 were THE SAME object.
-#        When slot 0 exhausts, slot 1 immediately exhausts too (same generator).
-#        Net result: math consumed once, not twice → 33/33/33 instead of 40/40/20.
-#        Fix: independent instances with distinct seeds per slot. ✓
-# Fix 6 [MEDIUM]  model.init dummy shape (1,64) → (1, MAX_SEQ_LEN).
-#        Init with T=64 compiled for that shape. First training step at T=16384
-#        triggered a full XLA recompile (expensive, minutes on TPU). ✓
-# Fix 7 [LOW]     TPU_CORES_STATIC assertion added.
-#        Silent shape mismatch if run on non-v5e-8 pod → now raises RuntimeError. ✓
-# Fix 8 [LOW]     YaRN denominator epsilon guard.
-#        Defensive jnp.where to prevent division by zero if YARN_ALPHA==YARN_BETA. ✓
+# ── AUDIT FIXES (v2.2) ────────────────────────────────────────────────────────
+# Fix 5 [CRITICAL] combined_stream shared generator references → 40/40/20 restored. ✓
+# Fix 6 [MEDIUM]  model.init (1,64) → (1, MAX_SEQ_LEN) → no first-step recompile. ✓
+# Fix 7 [LOW]     TPU_CORES_STATIC hard RuntimeError assertion. ✓
+# Fix 8 [LOW]     YaRN denominator epsilon guard. ✓
+#
+# ── FINAL FIXES (v2.3) ─────────────────────────────────────────────────────────
+# Fix 9  [CRITICAL] HBM budget: PER_CORE_BATCH 2→1, GRAD_ACCUM 16→32.
+#        With PER_CORE_BATCH=2: attention matrix [2,9,16384,16384] fp32
+#        = 19.7 GB alone — exceeds 16 GB per chip. Changed to batch=1:
+#        attention [1,9,16384,16384] fp32 = 9.86 GB. Total per-chip budget:
+#        params+opt (~2.8 GB) + grads (~1.1 GB) + activations (~9.9 GB)
+#        ≈ 13.8 GB → safely within 14-15 GB target. GLOBAL_BATCH unchanged: 256.
+# Fix 10 [MEDIUM]  XLA_FLAGS: GPU latency flag → correct TPU flags.
+#        --xla_gpu_enable_latency_hiding_scheduler has NO effect on TPU.
+#        Replaced with TPU-specific flags that overlap allreduce with compute.
+# Fix 11 [LOW]    JAX version guard: typed PRNG keys require JAX >= 0.4.16.
+# Fix 12 [LOW]    Val set underflow guard: fail loudly instead of silent reshape.
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -51,9 +50,16 @@ from functools import partial
 from queue import Queue
 from threading import Thread
 
+# FIX 10: TPU-specific XLA flags.
+# --xla_gpu_enable_latency_hiding_scheduler had zero effect on TPU (GPU-only flag).
+# The TPU equivalents overlap allreduce (pmean) with compute, reducing step time.
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"]   = "platform"
-os.environ["XLA_FLAGS"] = "--xla_gpu_enable_latency_hiding_scheduler=true"
+os.environ["XLA_FLAGS"] = (
+    "--xla_tpu_enable_latency_hiding_scheduler=true "
+    "--xla_tpu_enable_async_collective_fusion=true "
+    "--xla_tpu_enable_async_collective_fusion_fuse_all_gather=true"
+)
 
 import jax
 import jax.numpy as jnp
@@ -64,6 +70,16 @@ import flax.linen as nn
 from flax.training import train_state
 from flax import serialization
 import flax.jax_utils
+
+# FIX 11: JAX version guard. Typed PRNG key arrays (used for RNG in lax.scan)
+# require JAX >= 0.4.16. Kaggle TPU v5e-8 ships 0.4.30+ as of 2026, so this
+# will never fire in production but gives a clear error on stale environments.
+_jax_ver = tuple(int(x) for x in jax.__version__.split(".")[:3])
+if _jax_ver < (0, 4, 16):
+    raise RuntimeError(
+        f"JAX >= 0.4.16 required for typed PRNG keys in lax.scan. "
+        f"Found: {jax.__version__}"
+    )
 
 from datasets import load_dataset
 from transformers import PreTrainedTokenizerFast
@@ -139,7 +155,7 @@ log.info(f"JAX version: {jax.__version__}")
 log.info(f"JAX devices: {jax.devices()}")
 TPU_CORES = jax.device_count()
 
-# FIX 7: Hard assert — fail loudly if not running on the expected v5e-8 pod.
+# Hard assert: fail loudly if not the expected v5e-8 pod.
 # TPU_CORES_STATIC is a Python int literal so XLA sees a compile-time constant
 # in all reshapes (no dynamic-shape recompile risk).
 TPU_CORES_STATIC = 8
@@ -151,14 +167,29 @@ if TPU_CORES != TPU_CORES_STATIC:
         "update TPU_CORES_STATIC to match your device count."
     )
 
-PER_CORE_BATCH  = 2
-MICRO_BATCH     = PER_CORE_BATCH * TPU_CORES   # 16
-GRAD_ACCUM      = 16
-GLOBAL_BATCH    = MICRO_BATCH * GRAD_ACCUM     # 256
+# FIX 9: HBM budget correction.
+# PER_CORE_BATCH=2 at T=16384 materialises attention [2,9,16384,16384] fp32
+# = 19.7 GB per chip — exceeds the 16 GB HBM of each v5e chip entirely.
+# Reduced to PER_CORE_BATCH=1: attention becomes [1,9,16384,16384] = 9.86 GB.
+# GRAD_ACCUM doubled 16→32 to keep GLOBAL_BATCH = 256 unchanged.
+#
+# Per-chip HBM breakdown (PER_CORE_BATCH=1):
+#   Params (bf16)         :  280M × 2B          =  ~560 MB
+#   AdamW m+v (fp32)      :  280M × 2 × 4B     = ~2,240 MB
+#   Grad accumulator(fp32):  280M × 4B          = ~1,120 MB
+#   Peak attn matrix(fp32): [1,9,16384,16384]×4B = ~9,865 MB
+#   Misc (embeds, norms …):                        ~  200 MB
+#   TOTAL estimated peak                           ~13,985 MB  ≈ 13.7 GB  ✓
+PER_CORE_BATCH  = 1
+MICRO_BATCH     = PER_CORE_BATCH * TPU_CORES   # 8
+GRAD_ACCUM      = 32                            # was 16; doubled to keep global batch = 256
+GLOBAL_BATCH    = MICRO_BATCH * GRAD_ACCUM     # 8 × 32 = 256  (unchanged)
 
-log.info(f"TPU Cores: {TPU_CORES} | Per-core: {PER_CORE_BATCH} | "
-         f"Micro-batch: {MICRO_BATCH} | Global: {GLOBAL_BATCH} seqs/step")
+log.info(f"TPU Cores: {TPU_CORES} | Per-core batch: {PER_CORE_BATCH} | "
+         f"Micro-batch: {MICRO_BATCH} | Grad-accum: {GRAD_ACCUM} | "
+         f"Global batch: {GLOBAL_BATCH} seqs/step")
 log.info(f"Tokens/step: {GLOBAL_BATCH * MAX_SEQ_LEN / 1e6:.2f}M")
+log.info(f"Estimated per-chip HBM peak: ~13.7 GB / 16 GB")
 
 # ── Optimizer / Schedule ──────────────────────────────────────────────────────
 LEARNING_RATE = 3e-4
@@ -204,14 +235,10 @@ log.info(f"✓ Tokenizer loaded | vocab={len(tokenizer)} | pad_id={PAD_ID} | eos
 # ════════════════════════════════════════════════════════════════════════════════
 def build_yarn_rope_cache(seq_len: int, head_dim: int):
     """
-    YaRN (Yet another RoPE extensioN) scaled frequencies.
-    Extends RoPE to 16k context from a 512 base window.
-
-    Fix 2: Corrected interpolation direction.
-      t = 0.0 at high-freq boundary  → scale = 1.0       (no compression)
-      t = 1.0 at low-freq boundary   → scale = 1/factor  (full compression)
-    Fix 8: Epsilon guard in denominator to prevent division by zero if
-      YARN_ALPHA and YARN_BETA are accidentally set equal.
+    YaRN-scaled RoPE frequencies. Extends context from 512 → 16k.
+    t=0 at high-freq boundary (scale=1.0, no compression).
+    t=1 at low-freq  boundary (scale=1/factor, full compression).
+    Epsilon guard prevents division-by-zero if YARN_ALPHA==YARN_BETA.
     """
     freqs = 1.0 / (ROPE_BASE ** (jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim))
     wavelengths = 2.0 * jnp.pi / freqs
@@ -219,11 +246,9 @@ def build_yarn_rope_cache(seq_len: int, head_dim: int):
     low_boundary  = float(MAX_SEQ_LEN) / YARN_ALPHA   # 16384.0
     high_boundary = float(MAX_SEQ_LEN) / YARN_BETA     # 512.0
 
-    # FIX 8: guard against accidental YARN_ALPHA == YARN_BETA (div-by-zero)
-    den = low_boundary - high_boundary  # 15872.0 with current params
-    den = jnp.where(den == 0.0, 1e-6, den)
+    den = low_boundary - high_boundary                 # 15872.0
+    den = jnp.where(den == 0.0, 1e-6, den)             # epsilon guard
 
-    # t blends 0 (high-freq, unchanged) → 1 (low-freq, compressed)
     t = (wavelengths - high_boundary) / den
     t = jnp.clip(t, 0.0, 1.0)
     intermediate_scale = (1.0 - t) * 1.0 + t * (1.0 / YARN_SCALE_FACTOR)
@@ -231,11 +256,7 @@ def build_yarn_rope_cache(seq_len: int, head_dim: int):
     scale = jnp.where(
         wavelengths > low_boundary,
         1.0 / YARN_SCALE_FACTOR,
-        jnp.where(
-            wavelengths < high_boundary,
-            1.0,
-            intermediate_scale,
-        ),
+        jnp.where(wavelengths < high_boundary, 1.0, intermediate_scale),
     )
     freqs = freqs * scale
 
@@ -277,11 +298,10 @@ class MLAAttention(nn.Module):
     """
     Multi-head Latent Attention (DeepSeek-style MLA).
     Compresses KV into a low-rank latent vector to save HBM.
-    At 16k context bf16:
-      Standard KV = 2 × 16384 × 576 × 2B = ~36MB per layer
-      MLA latent  = 2 × 16384 × 128 × 2B =  ~8MB per layer  (4.5× saving)
-
-    Fix 3: Cast attn to float32 BEFORE applying the causal mask fill value.
+    At T=16384, bf16, PER_CORE_BATCH=1:
+      Standard KV = 2×16384×576×2B  = ~36 MB per layer
+      MLA latent  = 2×16384×128×2B  =  ~8 MB per layer  (4.5× saving)
+    Attention matrix [1,9,16384,16384] fp32 = 9.86 GB (fits within 16 GB HBM).
     """
     d_model:      int
     n_heads:      int
@@ -329,7 +349,7 @@ class MLAAttention(nn.Module):
 
         attn = jnp.matmul(q, k) * scale
 
-        # Fix 3: cast to float32 first, then mask, then softmax
+        # Cast to float32 first, then mask, then softmax.
         attn = attn.astype(jnp.float32)
         mask = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))
         attn = jnp.where(mask[None, None], attn, jnp.finfo(jnp.float32).min)
@@ -346,11 +366,8 @@ class MLAAttention(nn.Module):
 class ConvSwiGLU(nn.Module):
     """
     Causal SwiGLU FFN with strictly causal depthwise 1D conv on the gate path.
-
-    Fix 1: padding=((kernel_size-1, 0),) — left-pad only, no right-pad.
-    Flax nn.Conv accepts explicit (low, high) padding tuples per spatial dim.
-    With kernel_size=3, pad_left=2:
-      output[t] = conv(input[t-2], input[t-1], input[t])  ← strictly causal ✓
+    padding=((kernel_size-1, 0),): left-pad only, no right-pad (strictly causal).
+    output[t] = conv(input[t-(k-1)], ..., input[t])  ← no future tokens. ✓
     """
     d_model:      int
     hidden_dim:   int
@@ -413,6 +430,7 @@ class ZenyxV2(nn.Module):
     Nano-Titan: 8 unique blocks × 4 recurrences = 32 effective layers.
     Weight sharing: each TitanBlock(name="block_i") is called N_RECURRENCES times.
     Flax resolves param scope by name → subsequent calls reuse the same weights.
+    Total unique params: ~280M. Effective compute depth: 32 layers.
     """
     vocab_size:      int
     d_model:         int
@@ -459,11 +477,11 @@ class ZenyxV2(nn.Module):
 
         x = RMSNorm(self.d_model, name="final_norm")(x)
 
-        # t+1: weight-tied with embedding table
+        # t+1: weight-tied with embedding table (no extra params)
         logits_1 = x @ embed_table.T.astype(jnp.bfloat16)
         logits_list = [logits_1]
 
-        # t+2, t+3: independent projection heads
+        # t+2, t+3: independent small projection heads
         for i in range(1, self.mtp_heads):
             head_out = nn.Dense(
                 self.vocab_size, use_bias=False,
@@ -494,11 +512,10 @@ model = ZenyxV2(
     dropout_rate    = DROPOUT_RATE,
 )
 
-init_rng = jrand.PRNGKey(GLOBAL_SEED)
-# FIX 6: Init with MAX_SEQ_LEN so the compiled shape matches training.
-# Using (1, 64) before caused an expensive XLA recompile on the first training
-# step at T=16384. One init call at the full sequence length avoids this.
-dummy    = jnp.ones((1, MAX_SEQ_LEN), dtype=jnp.int32)
+init_rng  = jrand.PRNGKey(GLOBAL_SEED)
+# Init with MAX_SEQ_LEN so the compiled XLA shape matches training.
+# Using (1,64) previously triggered a full recompile on the first training step.
+dummy     = jnp.ones((1, MAX_SEQ_LEN), dtype=jnp.int32)
 variables = model.init(init_rng, input_ids=dummy, train=False)
 params    = variables["params"]
 
@@ -589,14 +606,14 @@ def compute_mtp_loss(params, batch, dropout_rng):
 def train_step_accum(state, micro_batches, dropout_rngs):
     """
     Gradient accumulation via lax.scan inside pmap.
-    Per-device shapes (after pmap sharding on axis 0):
-      micro_batches: [GRAD_ACCUM, PER_CORE_BATCH, SEQ_LEN]
-      dropout_rngs:  [GRAD_ACCUM]  typed PRNGKey array — passed directly,
-                     no key_data/wrap_key_data round-trip needed (Fix 4).
+    Per-device shapes after pmap shards axis-0:
+      micro_batches: [GRAD_ACCUM, PER_CORE_BATCH, SEQ_LEN]  = [32, 1, 16384]
+      dropout_rngs:  [GRAD_ACCUM]  typed PRNGKey array
+    lax.scan iterates GRAD_ACCUM=32 times, one micro-step per iteration.
     """
     def accum_fn(carry, inputs):
         grads_acc, loss_acc = carry
-        mb, rng = inputs   # rng is a single PRNGKey (scalar key)
+        mb, rng = inputs
         loss, grads = jax.value_and_grad(compute_mtp_loss)(state.params, mb, rng)
         grads_acc = jax.tree_util.tree_map(lambda a, b: a + b, grads_acc, grads)
         return (grads_acc, loss_acc + loss), None
@@ -648,7 +665,7 @@ def _encode(text: str):
 
 
 def stream_math(target_bytes: int, seed: int, skip_tokens: int = 0):
-    log.info(f"[MATH] finemath-3plus | target={target_bytes/1e9:.2f}GB | skip={skip_tokens:,} tokens")
+    log.info(f"[MATH] finemath-3plus | target={target_bytes/1e9:.2f}GB | skip={skip_tokens:,} tokens | seed={seed}")
     ds = load_dataset(
         "HuggingFaceTB/finemath", name="finemath-3plus",
         split="train", streaming=True,
@@ -675,7 +692,7 @@ def stream_math(target_bytes: int, seed: int, skip_tokens: int = 0):
 
 def stream_code(target_bytes: int, seed: int, skip_tokens: int = 0):
     per_lang = target_bytes // len(CODE_LANGS)
-    log.info(f"[CODE] {len(CODE_LANGS)} langs | {per_lang/1e6:.0f}MB each | skip={skip_tokens:,} tokens")
+    log.info(f"[CODE] {len(CODE_LANGS)} langs | {per_lang/1e6:.0f}MB each | skip={skip_tokens:,} tokens | seed={seed}")
     skipped = 0
     for lang in CODE_LANGS:
         try:
@@ -710,7 +727,7 @@ def stream_code(target_bytes: int, seed: int, skip_tokens: int = 0):
 
 def stream_english(target_bytes: int, seed: int, skip_tokens: int = 0):
     """Full FineWeb-Edu default split (~1.3T tokens), score >= 3.0 filter."""
-    log.info(f"[ENG] fineweb-edu (default) | target={target_bytes/1e9:.2f}GB | skip={skip_tokens:,} tokens")
+    log.info(f"[ENG] fineweb-edu | target={target_bytes/1e9:.2f}GB | skip={skip_tokens:,} tokens | seed={seed}")
     ds = load_dataset(
         "HuggingFaceFW/fineweb-edu",
         split="train", streaming=True,
@@ -740,18 +757,22 @@ def stream_english(target_bytes: int, seed: int, skip_tokens: int = 0):
 def combined_stream(resume_step: int, seed: int):
     """
     Weighted interleaved stream. Mix: 40% math | 40% code | 20% english.
+    Weighted cycle: [mathA, mathB, codeA, codeB, eng] → 2:2:1 ratio.
 
-    FIX 5: Each cycle slot gets its OWN independent generator instance with
-    a distinct seed. The previous code did:
-        cycle = [gen_math, gen_math, ...]  ← same object in two slots!
-    When slot 0 raised StopIteration, slot 1 (same object) immediately raised
-    it too, effectively halving math data and producing a 33/33/33 mix instead
-    of the intended 40/40/20. Fix: split the byte budget per slot and use
-    seed+1 for the second instance so the two math streams don't duplicate.
+    Each slot is an INDEPENDENT generator instance:
+    - mathA / mathB use seed and seed+1 (different shuffles of same dataset).
+    - codeA / codeB use seed+2 and seed+3 (code is a different dataset so
+      seed integer correlation with math seeds is irrelevant, but we space
+      them anyway for absolute clarity).
+    - Each slot gets half the modality byte budget so the two slots combined
+      consume the full math_bytes / code_bytes target.
+    - Skip tokens are split evenly between the two slots of each modality.
+      Integer truncation is at most 1 token per slot per resume — negligible
+      at 150B token scale (< 1e-10 fractional error).
     """
     total_bytes  = TOTAL_TOKENS * 2
-    math_bytes   = int(total_bytes * MATH_RATIO)   # split equally across 2 slots
-    code_bytes   = int(total_bytes * CODE_RATIO)   # split equally across 2 slots
+    math_bytes   = int(total_bytes * MATH_RATIO)
+    code_bytes   = int(total_bytes * CODE_RATIO)
     eng_bytes    = int(total_bytes * ENG_RATIO)
 
     tokens_done  = resume_step * GLOBAL_BATCH * MAX_SEQ_LEN
@@ -759,14 +780,12 @@ def combined_stream(resume_step: int, seed: int):
     code_skip    = int(tokens_done * CODE_RATIO)
     eng_skip     = int(tokens_done * ENG_RATIO)
 
-    # Each slot gets half the total budget for that modality so combined
-    # the two math slots together still consume math_bytes total.
     cycle = [
-        stream_math(math_bytes // 2, seed,     math_skip // 2),  # math slot A
-        stream_math(math_bytes // 2, seed + 1, math_skip // 2),  # math slot B (distinct seed)
-        stream_code(code_bytes // 2, seed,     code_skip // 2),  # code slot A
-        stream_code(code_bytes // 2, seed + 1, code_skip // 2),  # code slot B (distinct seed)
-        stream_english(eng_bytes,    seed,     eng_skip),        # eng  slot
+        stream_math(math_bytes // 2, seed,     math_skip // 2),   # mathA
+        stream_math(math_bytes // 2, seed + 1, math_skip // 2),   # mathB  (distinct shuffle)
+        stream_code(code_bytes // 2, seed + 2, code_skip // 2),   # codeA
+        stream_code(code_bytes // 2, seed + 3, code_skip // 2),   # codeB  (distinct shuffle)
+        stream_english(eng_bytes,    seed + 4, eng_skip),         # eng
     ]
     done  = [False] * 5
     idx   = 0
@@ -934,17 +953,29 @@ if val_batches_loaded is not None:
     log.info(f"✓ Val set from checkpoint: {val_batches.shape}")
 else:
     log.info(f"Building validation set ({VAL_BATCHES_N} batches)...")
+    # Target 3× the needed tokens to ensure we always have enough.
+    # VAL_BATCHES_N * MICRO_BATCH * MAX_SEQ_LEN = 128 * 8 * 16384 = 16,777,216 tokens.
+    # 3× target = ~50M tokens — vastly exceeds the stream budget, so no underflow.
+    _val_need = VAL_BATCHES_N * MICRO_BATCH   # 1024 blocks
     val_gen = stream_english(
-        target_bytes=VAL_BATCHES_N * MICRO_BATCH * MAX_SEQ_LEN * 3,
+        target_bytes=_val_need * MAX_SEQ_LEN * 3 * 2,
         seed=GLOBAL_SEED + 9999,
     )
     val_list = []
-    for _ in range(VAL_BATCHES_N * MICRO_BATCH):
+    for _ in range(_val_need):
         try:
             val_list.append(next(val_gen))
         except StopIteration:
             break
-    val_batches = np.array(val_list[:VAL_BATCHES_N * MICRO_BATCH], dtype=np.int32)
+
+    # FIX 12: Hard guard — fail loudly if the stream didn't produce enough blocks.
+    if len(val_list) < _val_need:
+        raise RuntimeError(
+            f"Val set underflow: got {len(val_list)} blocks, need {_val_need}. "
+            "Increase val stream target_bytes or reduce VAL_BATCHES_N."
+        )
+
+    val_batches = np.array(val_list, dtype=np.int32)
     val_batches = val_batches.reshape(VAL_BATCHES_N, MICRO_BATCH, MAX_SEQ_LEN)
     log.info(f"✓ Val set built: {val_batches.shape}")
 
@@ -958,7 +989,8 @@ log.info(f"  d_model={D_MODEL} | {N_UNIQUE_BLOCKS}×{N_RECURRENCES} recurrences 
          f"vocab={VOCAB_SIZE} | ctx={MAX_SEQ_LEN}")
 log.info(f"  Unique params: {param_count/1e6:.1f}M | "
          f"Effective depth: {N_UNIQUE_BLOCKS*N_RECURRENCES} layers")
-log.info(f"  Global batch: {GLOBAL_BATCH} seqs | "
+log.info(f"  Per-core batch: {PER_CORE_BATCH} | Grad-accum: {GRAD_ACCUM} | "
+         f"Global batch: {GLOBAL_BATCH} seqs | "
          f"{GLOBAL_BATCH*MAX_SEQ_LEN/1e6:.2f}M tokens/step")
 log.info("=" * 80)
 
@@ -973,6 +1005,8 @@ t_start     = time.time()
 
 try:
     while global_step < MAX_STEPS:
+        # Collect GRAD_ACCUM * MICRO_BATCH blocks for this step.
+        # With PER_CORE_BATCH=1, MICRO_BATCH=8, GRAD_ACCUM=32: 256 blocks total.
         step_blocks = []
         for _ in range(GRAD_ACCUM * MICRO_BATCH):
             block = prefetch_q.get()
@@ -984,22 +1018,21 @@ try:
         if len(step_blocks) < GRAD_ACCUM * MICRO_BATCH:
             break
 
-        # Reshape: [256, SEQ_LEN] → [TPU_CORES, GRAD_ACCUM, PER_CORE_BATCH, SEQ_LEN]
-        # TPU_CORES_STATIC is a Python int literal → compile-time constant for XLA.
+        # Reshape [256, SEQ_LEN] → [TPU_CORES, GRAD_ACCUM, PER_CORE_BATCH, SEQ_LEN]
+        # = [8, 32, 1, 16384]. TPU_CORES_STATIC is a Python int literal →
+        # XLA sees a compile-time constant; no dynamic shape / recompile risk.
         arr = np.array(step_blocks, dtype=np.int32)
         arr = arr.reshape(GRAD_ACCUM, TPU_CORES_STATIC, PER_CORE_BATCH, MAX_SEQ_LEN)
-        arr = arr.transpose(1, 0, 2, 3)
+        arr = arr.transpose(1, 0, 2, 3)  # [8, 32, 1, 16384]
         arr = jnp.asarray(arr, dtype=jnp.int32)
 
-        # FIX 4 (v2.2 simplification): produce dropout keys via pure jrand.split.
-        # jrand.split(key, n) returns a typed key array of shape [n].
-        # pmap shards axis-0 → each device receives [GRAD_ACCUM] keys.
-        # lax.scan iterates over them → each micro-step gets one unique key.
-        # No key_data/wrap_key_data needed at all.
+        # Pure jrand.split RNG: no key_data/wrap_key_data needed.
+        # jrand.split(key, n) returns a typed key array [n].
+        # pmap shards axis-0 → each device gets [GRAD_ACCUM] keys.
+        # lax.scan iterates axis-0 → each micro-step gets one unique PRNGKey.
         rng, step_rng = jrand.split(rng)
-        # [TPU_CORES, GRAD_ACCUM] typed key array
-        all_keys     = jrand.split(step_rng, TPU_CORES_STATIC * GRAD_ACCUM)
-        dropout_rngs = all_keys.reshape(TPU_CORES_STATIC, GRAD_ACCUM)
+        all_keys      = jrand.split(step_rng, TPU_CORES_STATIC * GRAD_ACCUM)
+        dropout_rngs  = all_keys.reshape(TPU_CORES_STATIC, GRAD_ACCUM)
 
         state, loss, grad_norm = train_step_accum(state, arr, dropout_rngs)
 
@@ -1028,6 +1061,8 @@ try:
             log.info(f"[EVAL] Running validation at step {global_step}...")
             val_losses = []
             for vb in val_batches:
+                # vb: [MICRO_BATCH, SEQ_LEN] = [8, 16384]
+                # reshape to [TPU_CORES, PER_CORE_BATCH, SEQ_LEN] = [8, 1, 16384]
                 vb_sharded = jnp.asarray(vb, dtype=jnp.int32).reshape(
                     TPU_CORES_STATIC, PER_CORE_BATCH, MAX_SEQ_LEN
                 )
@@ -1067,6 +1102,9 @@ try:
                     "kv_latent":       MLA_KV_LATENT,
                     "q_latent":        MLA_Q_LATENT,
                     "mtp_heads":       MTP_HEADS,
+                    "per_core_batch":  PER_CORE_BATCH,
+                    "grad_accum":      GRAD_ACCUM,
+                    "global_batch":    GLOBAL_BATCH,
                 },
             }
             save_checkpoint(
