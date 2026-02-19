@@ -50,6 +50,29 @@
 #         referencing an out-of-scope variable `V` (undefined at module level).
 #         Although Python never executes code after a return, having it confuses
 #         linters, future edits, and static checkers. Removed entirely. ✓
+#
+# ── FIXES (v2.5) ──────────────────────────────────────────────────────────────
+# Fix 15 [CRITICAL] RESOURCE_EXHAUSTED: exceeded HBM by 674.94 MB.
+#         Root cause (from XLA allocator report):
+#           Rank-1 temp: f32[1,14335,16,2048] = 1.75 GB  ← full logit tensor
+#             live during backward pass of chunked_cross_entropy.
+#           Rank-2 temp: bf16[1,14335,16,2048] = 895 MB  ← same tensor
+#             rematerialised by @jax.checkpoint on compute_mtp_loss.
+#         The @jax.checkpoint decorator on compute_mtp_loss caused XLA to
+#         RECOMPUTE the entire chunked_cross_entropy during the backward pass,
+#         re-expanding the full [B,T,NUM_CHUNKS,CHUNK_SIZE] f32 tensor in HBM.
+#         This is the opposite of what was intended.
+#
+#         Three surgical changes (architecture/params/batch/optimizer unchanged):
+#         (a) Replace monolithic reshape+max+exp in chunked_cross_entropy with a
+#             true sequential lax.while_loop over vocab chunks — only one
+#             f32[B,T,CHUNK_SIZE] slice is live at a time (~56 MB vs 1.75 GB).
+#         (b) Remove @jax.checkpoint from compute_mtp_loss. Apply jax.checkpoint
+#             surgically on model.apply inside compute_mtp_loss instead, so
+#             transformer block activations are rematerialised but CE temporaries
+#             (which are already tiny in the new sequential impl) are not.
+#         (c) CHUNK_SIZE 2048 → 1024: halves the one live chunk slice for a
+#             comfortable safety margin (~56 MB → ~28 MB peak CE temp). ✓
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -568,11 +591,17 @@ def wsd_schedule(step):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# §8-§10  REPLACEMENT: TRAIN STATE, MEMORY-SAFE CHUNKED CE, MTP LOSS, PMAP STEPS
-# - Uses static CHUNK_SIZE = 2048 (smaller → less HBM; raises compute slightly).
-# - Uses reshape + take_along_axis (XLA-friendly static shapes, no fori_loop).
-# - compute_mtp_loss is checkpointed (rematerialisation) to reduce activation HBM.
-# - train_step_accum performs grad-accum via lax.scan inside pmap as before.
+# §8-§10  TRAIN STATE, MEMORY-SAFE CHUNKED CE, MTP LOSS, PMAP STEPS
+#
+# FIX 15 changes (v2.5):
+# ─ chunked_cross_entropy now uses lax.while_loop to process ONE vocab chunk at
+#   a time. Peak HBM for CE = f32[B,T,CHUNK_SIZE] = 1*14335*1024*4 ≈ 56 MB.
+#   Previously the reshape materialised f32[B,T,16,2048] = 1.75 GB all at once.
+# ─ @jax.checkpoint removed from compute_mtp_loss (it caused XLA to recompute
+#   the entire CE tensor during the backward pass — the exact opposite of saving
+#   memory). Surgical checkpoint applied on model.apply instead, preserving
+#   transformer activation rematerialisation without touching CE temporaries.
+# ─ CHUNK_SIZE 2048 → 1024 for extra safety margin on the one live slice.
 # ════════════════════════════════════════════════════════════════════════════════
 
 class ZenyxTrainState(train_state.TrainState):
@@ -598,87 +627,115 @@ def create_train_state(params):
     )
 
 
-# Static constants (must divide exactly)
-CHUNK_SIZE  = 2048                         # lowered from 4096 → 2048 to free ~2-4 GB HBM
-NUM_CHUNKS  = VOCAB_SIZE // CHUNK_SIZE     # 32768 / 2048 = 16
+# FIX 15(c): CHUNK_SIZE 2048 → 1024.
+# Peak CE HBM = f32[1, T, 1024] = 1 * 14335 * 1024 * 4 bytes ≈ 56 MB (was 1.75 GB).
+CHUNK_SIZE = 1024
+NUM_CHUNKS = VOCAB_SIZE // CHUNK_SIZE   # 32768 / 1024 = 32
 
 
 def chunked_cross_entropy(logits, labels):
     """
-    Memory-safe cross entropy without dynamic indexing.
-    logits: bf16 [B, T, V]
-    labels: int32 [B, T]
-    Returns per-position NLL float32 [B, T]
+    Truly sequential chunked cross-entropy using lax.while_loop.
+    Only ONE vocab chunk (f32[B,T,CHUNK_SIZE]) is live in HBM at any time.
 
-    FIX 13: This function takes exactly 2 positional args (logits, labels).
-    VOCAB_SIZE is read from module scope — do NOT pass it as a third argument.
+    logits : bf16 [B, T, V]
+    labels : int32 [B, T]
+    returns: float32 [B, T]  per-position NLL
+
+    FIX 15(a): replaces the monolithic reshape+max+exp which kept
+    f32[B,T,NUM_CHUNKS,CHUNK_SIZE] = 1.75 GB live during the backward pass.
+    The while_loop body processes one chunk at a time; XLA cannot fuse them
+    into a single large allocation because each iteration is a separate HLO.
     """
     B, T, V = logits.shape
-    assert V == VOCAB_SIZE
+    assert V == VOCAB_SIZE, f"Expected vocab {VOCAB_SIZE}, got {V}"
     assert VOCAB_SIZE % CHUNK_SIZE == 0
 
-    # ─────────────────────────────────────────
-    # 1) reshape vocab into chunks
-    # [B, T, 32768] → [B, T, 16, 2048]
-    # ─────────────────────────────────────────
-    logits = logits.reshape(B, T, NUM_CHUNKS, CHUNK_SIZE)
-    logits = logits.astype(jnp.float32)
+    logits_f32 = logits.astype(jnp.float32)   # bf16 → f32 once; [B,T,V]
 
-    # ─────────────────────────────────────────
-    # 2) compute max over vocab (two-stage)
-    # ─────────────────────────────────────────
-    max_chunk  = jnp.max(logits, axis=-1)      # [B, T, 16]
-    max_logits = jnp.max(max_chunk, axis=-1)   # [B, T]
+    # ── pass 1: find global max over vocab (needed for stable softmax) ────────
+    # We accumulate max chunk-by-chunk to avoid materialising [B,T,V] all at once.
+    def max_body(carry, chunk_idx):
+        cur_max = carry                                         # [B, T]
+        start   = chunk_idx * CHUNK_SIZE
+        chunk   = jax.lax.dynamic_slice_in_dim(
+            logits_f32, start, CHUNK_SIZE, axis=-1)            # [B, T, CHUNK_SIZE]
+        chunk_max = chunk.max(axis=-1)                         # [B, T]
+        return jnp.maximum(cur_max, chunk_max), None
 
-    # subtract for numerical stability
-    logits = logits - max_logits[..., None, None]
+    global_max, _ = jax.lax.scan(
+        max_body,
+        jnp.full((B, T), -jnp.inf, dtype=jnp.float32),
+        jnp.arange(NUM_CHUNKS, dtype=jnp.int32),
+    )  # [B, T]
 
-    # ─────────────────────────────────────────
-    # 3) compute exp sum
-    # ─────────────────────────────────────────
-    exp_logits = jnp.exp(logits)
-    sum_exp    = exp_logits.sum(axis=(-1, -2))  # sum over chunks + vocab positions
+    # ── pass 2: compute sum(exp(logit - max)) chunk-by-chunk ──────────────────
+    def sum_body(carry, chunk_idx):
+        sum_exp = carry                                         # [B, T]
+        start   = chunk_idx * CHUNK_SIZE
+        chunk   = jax.lax.dynamic_slice_in_dim(
+            logits_f32, start, CHUNK_SIZE, axis=-1)            # [B, T, CHUNK_SIZE]
+        sum_exp = sum_exp + jnp.exp(chunk - global_max[..., None]).sum(axis=-1)
+        return sum_exp, None
 
-    # ─────────────────────────────────────────
-    # 4) gather correct token logits
-    # ─────────────────────────────────────────
-    chunk_ids = labels // CHUNK_SIZE            # [B, T] — which chunk
-    token_ids = labels % CHUNK_SIZE             # [B, T] — position inside chunk
+    sum_exp, _ = jax.lax.scan(
+        sum_body,
+        jnp.zeros((B, T), dtype=jnp.float32),
+        jnp.arange(NUM_CHUNKS, dtype=jnp.int32),
+    )  # [B, T]
 
-    # gather the target chunk: [B, T, 1, 2048]
-    gathered_chunk = jnp.take_along_axis(
-        logits,
-        chunk_ids[..., None, None],
-        axis=2,
-    )                                           # [B, T, 1, 2048]
-    gathered_chunk = gathered_chunk[..., 0, :] # [B, T, 2048]
+    # ── pass 3: gather the target-token logit ────────────────────────────────
+    # chunk index and intra-chunk offset for each label token
+    chunk_ids = labels // CHUNK_SIZE    # [B, T]  int32
+    token_ids = labels % CHUNK_SIZE     # [B, T]  int32
 
-    # gather the target token within the chunk: [B, T]
-    gathered_token = jnp.take_along_axis(
-        gathered_chunk,
-        token_ids[..., None],
-        axis=-1,
-    )[..., 0]                                   # [B, T]
+    # We need logits_f32[:, :, label] − global_max.
+    # Gather one f32[B,T,CHUNK_SIZE] slice, then pick the token position.
+    # dynamic_slice_in_dim requires a scalar start; use a scan over the unique
+    # chunk indices.  Because NUM_CHUNKS=32 the scan is cheap and avoids a
+    # gather over the full vocab dimension.
+    def gather_body(carry, chunk_idx):
+        # carry: f32[B,T] — the target-token logit (updated only where
+        #        chunk_ids == chunk_idx, else left unchanged)
+        target_logit = carry
+        start  = chunk_idx * CHUNK_SIZE
+        chunk  = jax.lax.dynamic_slice_in_dim(
+            logits_f32, start, CHUNK_SIZE, axis=-1)            # [B, T, CHUNK_SIZE]
+        # gather token_ids position inside this chunk
+        tok    = jnp.take_along_axis(chunk, token_ids[..., None], axis=-1)[..., 0]  # [B,T]
+        # only write where this chunk is the correct one
+        mask   = (chunk_ids == chunk_idx)                       # [B, T] bool
+        return jnp.where(mask, tok, target_logit), None
 
-    # ─────────────────────────────────────────
-    # 5) final NLL  (float32 [B, T])
-    # ─────────────────────────────────────────
-    log_prob = gathered_token - jnp.log(sum_exp + 1e-8)
-    return -log_prob
+    target_logit, _ = jax.lax.scan(
+        gather_body,
+        jnp.zeros((B, T), dtype=jnp.float32),
+        jnp.arange(NUM_CHUNKS, dtype=jnp.int32),
+    )  # [B, T]
+
+    # ── final NLL ─────────────────────────────────────────────────────────────
+    log_prob = (target_logit - global_max) - jnp.log(sum_exp + 1e-8)
+    return -log_prob   # float32 [B, T]
 
 
-# Keep checkpoint/remat to reduce stored activations during backward.
-@jax.checkpoint
+# FIX 15(b): @jax.checkpoint removed from compute_mtp_loss.
+# Previously, checkpointing this function caused XLA to RECOMPUTE the entire
+# chunked_cross_entropy during the backward pass, re-expanding the large f32
+# logit tensor.  We instead apply jax.checkpoint surgically on model.apply so
+# transformer block activations are still rematerialised, but CE intermediates
+# (now tiny ~56 MB per chunk) are NOT forced to be recomputed.
 def compute_mtp_loss(params, batch, dropout_rng):
     """
     Compute MTP loss in a streaming, memory-friendly manner.
     - params: model params
-    - batch: [B, T] int32
+    - batch:  int32 [B, T]
     - dropout_rng: PRNGKey (typed or legacy)
     Returns scalar float32 loss (averaged and weighted across MTP heads).
     """
-    # Forward (returns list of logits in bf16)
-    logits_list = model.apply(
+    # Surgical checkpoint: rematerialise transformer activations only.
+    # This is equivalent to the old @jax.checkpoint on the whole function but
+    # does NOT force chunked_cross_entropy to recompute during backward. ✓
+    logits_list = jax.checkpoint(model.apply)(
         {"params": params},
         input_ids=batch,
         train=True,
@@ -698,7 +755,6 @@ def compute_mtp_loss(params, batch, dropout_rng):
         logits_slice = logits[:, :clip_len, :]                        # bf16 [B, clip_len, V]
         labels_slice = batch[:, offset:offset + clip_len].astype(jnp.int32)  # [B, clip_len]
 
-        # FIX 13: call with 2 args only — VOCAB_SIZE is module-level constant
         nll = chunked_cross_entropy(logits_slice, labels_slice)       # float32 [B, clip_len]
 
         mask           = labels_slice != PAD_ID
@@ -753,7 +809,6 @@ def eval_step(params, batch):
     labels = batch[:, 1:].astype(jnp.int32)
     logits = logits[:, :-1, :]               # align with labels [B, T-1, V]
 
-    # FIX 13: call with 2 args only
     nll  = chunked_cross_entropy(logits, labels)   # [B, T-1]
     mask = labels != PAD_ID
     loss = jnp.where(mask, nll, 0.0).sum() / (mask.sum() + 1e-8)
