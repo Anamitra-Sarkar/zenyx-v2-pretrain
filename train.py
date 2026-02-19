@@ -58,21 +58,26 @@
 #             live during backward pass of chunked_cross_entropy.
 #           Rank-2 temp: bf16[1,14335,16,2048] = 895 MB  ← same tensor
 #             rematerialised by @jax.checkpoint on compute_mtp_loss.
-#         The @jax.checkpoint decorator on compute_mtp_loss caused XLA to
-#         RECOMPUTE the entire chunked_cross_entropy during the backward pass,
-#         re-expanding the full [B,T,NUM_CHUNKS,CHUNK_SIZE] f32 tensor in HBM.
-#         This is the opposite of what was intended.
+#         Three surgical changes:
+#         (a) Replace monolithic reshape+max+exp with sequential lax.scan.
+#         (b) Remove @jax.checkpoint from compute_mtp_loss; apply surgically
+#             on model.apply instead.
+#         (c) CHUNK_SIZE 2048 → 1024 for extra HBM safety margin. ✓
 #
-#         Three surgical changes (architecture/params/batch/optimizer unchanged):
-#         (a) Replace monolithic reshape+max+exp in chunked_cross_entropy with a
-#             true sequential lax.while_loop over vocab chunks — only one
-#             f32[B,T,CHUNK_SIZE] slice is live at a time (~56 MB vs 1.75 GB).
-#         (b) Remove @jax.checkpoint from compute_mtp_loss. Apply jax.checkpoint
-#             surgically on model.apply inside compute_mtp_loss instead, so
-#             transformer block activations are rematerialised but CE temporaries
-#             (which are already tiny in the new sequential impl) are not.
-#         (c) CHUNK_SIZE 2048 → 1024: halves the one live chunk slice for a
-#             comfortable safety margin (~56 MB → ~28 MB peak CE temp). ✓
+# ── FIXES (v2.6) ──────────────────────────────────────────────────────────────
+# Fix 16 [CRITICAL] InvalidFilterError: "JitTracer(bool[])"
+#         Root cause:
+#           jax.checkpoint(model.apply)(..., mutable=False) passes the Python
+#           bool False through JAX's abstract evaluation / tracing machinery.
+#           JAX converts it to a JitTracer(bool[]) abstract value.
+#           Flax's scope.in_filter() only accepts real Python bool/str/DenyList
+#           — never traced values — so it raises InvalidFilterError.
+#         Fix:
+#           Wrap the forward pass in a plain Python helper _fwd() that closes
+#           over mutable as a compile-time Python constant (never touches the
+#           JAX tracer). Apply jax.checkpoint to _fwd instead of model.apply
+#           directly. The rematerialisation boundary is identical; Flax never
+#           receives a traced bool. ✓
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -85,10 +90,6 @@ from functools import partial
 from queue import Queue
 from threading import Thread
 
-# FIX 10: TPU-specific XLA flags.
-# --xla_gpu_enable_latency_hiding_scheduler had zero effect on TPU (GPU-only flag).
-# The TPU equivalents overlap allreduce (pmean) with compute, reducing step time.
-
 import jax
 import jax.numpy as jnp
 from jax import random as jrand
@@ -99,9 +100,7 @@ from flax.training import train_state
 from flax import serialization
 import flax.jax_utils
 
-# FIX 11: JAX version guard. Typed PRNG key arrays (used for RNG in lax.scan)
-# require JAX >= 0.4.16. Kaggle TPU v5e-8 ships 0.4.30+ as of 2026, so this
-# will never fire in production but gives a clear error on stale environments.
+# FIX 11: JAX version guard.
 _jax_ver = tuple(int(x) for x in jax.__version__.split(".")[:3])
 if _jax_ver < (0, 4, 16):
     raise RuntimeError(
@@ -160,13 +159,13 @@ TMP_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Model Dimensions ──────────────────────────────────────────────────────────
 VOCAB_SIZE      = 32_768
-D_MODEL         = 576       # head_dim=64, 9 heads → 576
+D_MODEL         = 576
 N_HEADS         = 9
-N_KV_HEADS      = 3         # GQA 3:1
+N_KV_HEADS      = 3
 HEAD_DIM        = D_MODEL // N_HEADS   # 64
 MLP_HIDDEN      = 1536
 N_UNIQUE_BLOCKS = 8
-N_RECURRENCES   = 4         # effective depth = 32
+N_RECURRENCES   = 4
 MAX_SEQ_LEN     = 14_336
 DROPOUT_RATE    = 0.0
 
@@ -183,9 +182,6 @@ log.info(f"JAX version: {jax.__version__}")
 log.info(f"JAX devices: {jax.devices()}")
 TPU_CORES = jax.device_count()
 
-# Hard assert: fail loudly if not the expected v5e-8 pod.
-# TPU_CORES_STATIC is a Python int literal so XLA sees a compile-time constant
-# in all reshapes (no dynamic-shape recompile risk).
 TPU_CORES_STATIC = 8
 if TPU_CORES != TPU_CORES_STATIC:
     raise RuntimeError(
@@ -195,23 +191,10 @@ if TPU_CORES != TPU_CORES_STATIC:
         "update TPU_CORES_STATIC to match your device count."
     )
 
-# FIX 9: HBM budget correction.
-# PER_CORE_BATCH=2 at T=16384 materialises attention [2,9,16384,16384] fp32
-# = 19.7 GB per chip — exceeds the 16 GB HBM of each v5e chip entirely.
-# Reduced to PER_CORE_BATCH=1: attention becomes [1,9,16384,16384] = 9.86 GB.
-# GRAD_ACCUM doubled 16→32 to keep GLOBAL_BATCH = 256 unchanged.
-#
-# Per-chip HBM breakdown (PER_CORE_BATCH=1):
-#   Params (bf16)         :  280M × 2B          =  ~560 MB
-#   AdamW m+v (fp32)      :  280M × 2 × 4B     = ~2,240 MB
-#   Grad accumulator(fp32):  280M × 4B          = ~1,120 MB
-#   Peak attn matrix(fp32): [1,9,16384,16384]×4B = ~9,865 MB
-#   Misc (embeds, norms …):                        ~  200 MB
-#   TOTAL estimated peak                           ~13,985 MB  ≈ 13.7 GB  ✓
 PER_CORE_BATCH  = 1
 MICRO_BATCH     = PER_CORE_BATCH * TPU_CORES   # 8
-GRAD_ACCUM      = 32                            # was 16; doubled to keep global batch = 256
-GLOBAL_BATCH    = MICRO_BATCH * GRAD_ACCUM     # 8 × 32 = 256  (unchanged)
+GRAD_ACCUM      = 32
+GLOBAL_BATCH    = MICRO_BATCH * GRAD_ACCUM     # 256
 
 log.info(f"TPU Cores: {TPU_CORES} | Per-core batch: {PER_CORE_BATCH} | "
          f"Micro-batch: {MICRO_BATCH} | Grad-accum: {GRAD_ACCUM} | "
@@ -262,20 +245,14 @@ log.info(f"✓ Tokenizer loaded | vocab={len(tokenizer)} | pad_id={PAD_ID} | eos
 # §4  YARN-SCALED ROPE
 # ════════════════════════════════════════════════════════════════════════════════
 def build_yarn_rope_cache(seq_len: int, head_dim: int):
-    """
-    YaRN-scaled RoPE frequencies. Extends context from 512 → 16k.
-    t=0 at high-freq boundary (scale=1.0, no compression).
-    t=1 at low-freq  boundary (scale=1/factor, full compression).
-    Epsilon guard prevents division-by-zero if YARN_ALPHA==YARN_BETA.
-    """
     freqs = 1.0 / (ROPE_BASE ** (jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim))
     wavelengths = 2.0 * jnp.pi / freqs
 
-    low_boundary  = float(MAX_SEQ_LEN) / YARN_ALPHA   # 16384.0
-    high_boundary = float(MAX_SEQ_LEN) / YARN_BETA     # 512.0
+    low_boundary  = float(MAX_SEQ_LEN) / YARN_ALPHA
+    high_boundary = float(MAX_SEQ_LEN) / YARN_BETA
 
-    den = low_boundary - high_boundary                 # 15872.0
-    den = jnp.where(den == 0.0, 1e-6, den)             # epsilon guard
+    den = low_boundary - high_boundary
+    den = jnp.where(den == 0.0, 1e-6, den)
 
     t = (wavelengths - high_boundary) / den
     t = jnp.clip(t, 0.0, 1.0)
@@ -323,11 +300,6 @@ class RMSNorm(nn.Module):
 
 
 class MLAAttention(nn.Module):
-    """
-    Multi-head Latent Attention (DeepSeek-style MLA).
-    Uses fused TPU attention (jax.nn.dot_product_attention)
-    so no full [T,T] matrix is materialized.
-    """
     d_model:      int
     n_heads:      int
     n_kv_heads:   int
@@ -340,82 +312,46 @@ class MLAAttention(nn.Module):
     def __call__(self, x, sin, cos, deterministic: bool):
         B, T, _ = x.shape
 
-        # ─────────────────────────────────────────
-        # Q projection (latent compression)
-        # ─────────────────────────────────────────
         q = nn.Dense(self.q_latent, use_bias=False, dtype=jnp.bfloat16)(x)
         q = RMSNorm(self.q_latent)(q)
-        q = nn.Dense(self.n_heads * self.head_dim,
-                     use_bias=False,
-                     dtype=jnp.bfloat16)(q)
+        q = nn.Dense(self.n_heads * self.head_dim, use_bias=False, dtype=jnp.bfloat16)(q)
         q = q.reshape(B, T, self.n_heads, self.head_dim)
 
-        # ─────────────────────────────────────────
-        # KV projection (shared latent compression)
-        # ─────────────────────────────────────────
-        kv_lat = nn.Dense(self.kv_latent,
-                          use_bias=False,
-                          dtype=jnp.bfloat16)(x)
+        kv_lat = nn.Dense(self.kv_latent, use_bias=False, dtype=jnp.bfloat16)(x)
         kv_lat = RMSNorm(self.kv_latent)(kv_lat)
 
-        k = nn.Dense(self.n_kv_heads * self.head_dim,
-                     use_bias=False,
-                     dtype=jnp.bfloat16)(kv_lat)
-        v = nn.Dense(self.n_kv_heads * self.head_dim,
-                     use_bias=False,
-                     dtype=jnp.bfloat16)(kv_lat)
+        k = nn.Dense(self.n_kv_heads * self.head_dim, use_bias=False, dtype=jnp.bfloat16)(kv_lat)
+        v = nn.Dense(self.n_kv_heads * self.head_dim, use_bias=False, dtype=jnp.bfloat16)(kv_lat)
 
         k = k.reshape(B, T, self.n_kv_heads, self.head_dim)
         v = v.reshape(B, T, self.n_kv_heads, self.head_dim)
 
-        # ─────────────────────────────────────────
-        # RoPE
-        # ─────────────────────────────────────────
         sin_ = sin[None, :T, None, :]
         cos_ = cos[None, :T, None, :]
         q = apply_rope(q, sin_, cos_)
         k = apply_rope(k, sin_, cos_)
 
-        # ─────────────────────────────────────────
-        # GQA expansion (repeat KV heads)
-        # ─────────────────────────────────────────
         repeat = self.n_heads // self.n_kv_heads
         if repeat > 1:
             k = jnp.repeat(k, repeat, axis=2)
             v = jnp.repeat(v, repeat, axis=2)
 
-        # ─────────────────────────────────────────
-        # TPU-FUSED MEMORY-EFFICIENT ATTENTION
-        # ─────────────────────────────────────────
-        # Shapes required: [B, H, T, D]
         q = q.transpose(0, 2, 1, 3)
         k = k.transpose(0, 2, 1, 3)
         v = v.transpose(0, 2, 1, 3)
 
         out = jax.nn.dot_product_attention(
-            query=q,
-            key=k,
-            value=v,
-            bias=None,
-            mask=None,
+            query=q, key=k, value=v,
+            bias=None, mask=None,
             is_causal=True,
             scale=1.0 / math.sqrt(self.head_dim),
         )
 
-        # Back to [B, T, D_model]
         out = out.transpose(0, 2, 1, 3).reshape(B, T, self.d_model)
-
-        return nn.Dense(self.d_model,
-                        use_bias=False,
-                        dtype=jnp.bfloat16)(out)
+        return nn.Dense(self.d_model, use_bias=False, dtype=jnp.bfloat16)(out)
 
 
 class ConvSwiGLU(nn.Module):
-    """
-    Causal SwiGLU FFN with strictly causal depthwise 1D conv on the gate path.
-    padding=((kernel_size-1, 0),): left-pad only, no right-pad (strictly causal).
-    output[t] = conv(input[t-(k-1)], ..., input[t])  ← no future tokens. ✓
-    """
     d_model:      int
     hidden_dim:   int
     dropout_rate: float = 0.0
@@ -431,7 +367,7 @@ class ConvSwiGLU(nn.Module):
             kernel_size=(self.kernel_size,),
             strides=(1,),
             padding=((self.kernel_size - 1, 0),),  # left-pad only → causal ✓
-            feature_group_count=self.hidden_dim,   # depthwise
+            feature_group_count=self.hidden_dim,
             use_bias=False,
             dtype=jnp.bfloat16,
         )(gate)
@@ -445,7 +381,6 @@ class ConvSwiGLU(nn.Module):
 
 
 class TitanBlock(nn.Module):
-    """Single unique Transformer block. Weights shared across recurrences."""
     d_model:      int
     n_heads:      int
     n_kv_heads:   int
@@ -473,12 +408,6 @@ class TitanBlock(nn.Module):
 
 
 class ZenyxV2(nn.Module):
-    """
-    Nano-Titan: 8 unique blocks × 4 recurrences = 32 effective layers.
-    Weight sharing: each TitanBlock(name="block_i") is called N_RECURRENCES times.
-    Flax resolves param scope by name → subsequent calls reuse the same weights.
-    Total unique params: ~280M. Effective compute depth: 32 layers.
-    """
     vocab_size:      int
     d_model:         int
     n_heads:         int
@@ -524,11 +453,9 @@ class ZenyxV2(nn.Module):
 
         x = RMSNorm(self.d_model, name="final_norm")(x)
 
-        # t+1: weight-tied with embedding table (no extra params)
         logits_1 = x @ embed_table.T.astype(jnp.bfloat16)
         logits_list = [logits_1]
 
-        # t+2, t+3: independent small projection heads
         for i in range(1, self.mtp_heads):
             head_out = nn.Dense(
                 self.vocab_size, use_bias=False,
@@ -560,8 +487,6 @@ model = ZenyxV2(
 )
 
 init_rng  = jrand.PRNGKey(GLOBAL_SEED)
-# Init with MAX_SEQ_LEN so the compiled XLA shape matches training.
-# Using (1,64) previously triggered a full recompile on the first training step.
 dummy     = jnp.ones((1, MAX_SEQ_LEN), dtype=jnp.int32)
 variables = model.init(init_rng, input_ids=dummy, train=False)
 params    = variables["params"]
@@ -576,7 +501,6 @@ log.info(f"  BF16 model size: {param_count * 2 / 1e6:.1f} MB")
 # §7  WSD LEARNING RATE SCHEDULE
 # ════════════════════════════════════════════════════════════════════════════════
 def wsd_schedule(step):
-    """Warmup-Stable-Decay: linear warmup → constant → cosine decay."""
     warmup_lr = LEARNING_RATE * jnp.minimum(step / WARMUP_STEPS, 1.0)
     decay_progress = jnp.clip(
         (step - WARMUP_STEPS - STABLE_STEPS) / DECAY_STEPS, 0.0, 1.0
@@ -591,17 +515,7 @@ def wsd_schedule(step):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# §8-§10  TRAIN STATE, MEMORY-SAFE CHUNKED CE, MTP LOSS, PMAP STEPS
-#
-# FIX 15 changes (v2.5):
-# ─ chunked_cross_entropy now uses lax.while_loop to process ONE vocab chunk at
-#   a time. Peak HBM for CE = f32[B,T,CHUNK_SIZE] = 1*14335*1024*4 ≈ 56 MB.
-#   Previously the reshape materialised f32[B,T,16,2048] = 1.75 GB all at once.
-# ─ @jax.checkpoint removed from compute_mtp_loss (it caused XLA to recompute
-#   the entire CE tensor during the backward pass — the exact opposite of saving
-#   memory). Surgical checkpoint applied on model.apply instead, preserving
-#   transformer activation rematerialisation without touching CE temporaries.
-# ─ CHUNK_SIZE 2048 → 1024 for extra safety margin on the one live slice.
+# §8  TRAIN STATE
 # ════════════════════════════════════════════════════════════════════════════════
 
 class ZenyxTrainState(train_state.TrainState):
@@ -627,121 +541,127 @@ def create_train_state(params):
     )
 
 
-# FIX 15(c): CHUNK_SIZE 2048 → 1024.
-# Peak CE HBM = f32[1, T, 1024] = 1 * 14335 * 1024 * 4 bytes ≈ 56 MB (was 1.75 GB).
+# ════════════════════════════════════════════════════════════════════════════════
+# §9  CHUNKED CROSS-ENTROPY
+#
+# Sequential lax.scan over vocab chunks — only ONE f32[B,T,CHUNK_SIZE] slice
+# is live in HBM at any time (~56 MB peak vs 1.75 GB for monolithic reshape).
+# ════════════════════════════════════════════════════════════════════════════════
 CHUNK_SIZE = 1024
-NUM_CHUNKS = VOCAB_SIZE // CHUNK_SIZE   # 32768 / 1024 = 32
+NUM_CHUNKS = VOCAB_SIZE // CHUNK_SIZE   # 32
 
 
 def chunked_cross_entropy(logits, labels):
     """
-    Truly sequential chunked cross-entropy using lax.while_loop.
-    Only ONE vocab chunk (f32[B,T,CHUNK_SIZE]) is live in HBM at any time.
-
+    Memory-safe chunked cross-entropy.
     logits : bf16 [B, T, V]
     labels : int32 [B, T]
     returns: float32 [B, T]  per-position NLL
-
-    FIX 15(a): replaces the monolithic reshape+max+exp which kept
-    f32[B,T,NUM_CHUNKS,CHUNK_SIZE] = 1.75 GB live during the backward pass.
-    The while_loop body processes one chunk at a time; XLA cannot fuse them
-    into a single large allocation because each iteration is a separate HLO.
     """
     B, T, V = logits.shape
     assert V == VOCAB_SIZE, f"Expected vocab {VOCAB_SIZE}, got {V}"
     assert VOCAB_SIZE % CHUNK_SIZE == 0
 
-    logits_f32 = logits.astype(jnp.float32)   # bf16 → f32 once; [B,T,V]
+    logits_f32 = logits.astype(jnp.float32)
 
-    # ── pass 1: find global max over vocab (needed for stable softmax) ────────
-    # We accumulate max chunk-by-chunk to avoid materialising [B,T,V] all at once.
+    # Pass 1: global max over vocab (stable softmax numerics)
     def max_body(carry, chunk_idx):
-        cur_max = carry                                         # [B, T]
-        start   = chunk_idx * CHUNK_SIZE
-        chunk   = jax.lax.dynamic_slice_in_dim(
-            logits_f32, start, CHUNK_SIZE, axis=-1)            # [B, T, CHUNK_SIZE]
-        chunk_max = chunk.max(axis=-1)                         # [B, T]
-        return jnp.maximum(cur_max, chunk_max), None
+        start = chunk_idx * CHUNK_SIZE
+        chunk = jax.lax.dynamic_slice_in_dim(logits_f32, start, CHUNK_SIZE, axis=-1)
+        return jnp.maximum(carry, chunk.max(axis=-1)), None
 
     global_max, _ = jax.lax.scan(
         max_body,
         jnp.full((B, T), -jnp.inf, dtype=jnp.float32),
         jnp.arange(NUM_CHUNKS, dtype=jnp.int32),
-    )  # [B, T]
+    )
 
-    # ── pass 2: compute sum(exp(logit - max)) chunk-by-chunk ──────────────────
+    # Pass 2: sum(exp(logit - max)) chunk-by-chunk
     def sum_body(carry, chunk_idx):
-        sum_exp = carry                                         # [B, T]
-        start   = chunk_idx * CHUNK_SIZE
-        chunk   = jax.lax.dynamic_slice_in_dim(
-            logits_f32, start, CHUNK_SIZE, axis=-1)            # [B, T, CHUNK_SIZE]
-        sum_exp = sum_exp + jnp.exp(chunk - global_max[..., None]).sum(axis=-1)
-        return sum_exp, None
+        start = chunk_idx * CHUNK_SIZE
+        chunk = jax.lax.dynamic_slice_in_dim(logits_f32, start, CHUNK_SIZE, axis=-1)
+        return carry + jnp.exp(chunk - global_max[..., None]).sum(axis=-1), None
 
     sum_exp, _ = jax.lax.scan(
         sum_body,
         jnp.zeros((B, T), dtype=jnp.float32),
         jnp.arange(NUM_CHUNKS, dtype=jnp.int32),
-    )  # [B, T]
+    )
 
-    # ── pass 3: gather the target-token logit ────────────────────────────────
-    # chunk index and intra-chunk offset for each label token
-    chunk_ids = labels // CHUNK_SIZE    # [B, T]  int32
-    token_ids = labels % CHUNK_SIZE     # [B, T]  int32
+    # Pass 3: gather target-token logit
+    chunk_ids = labels // CHUNK_SIZE
+    token_ids = labels % CHUNK_SIZE
 
-    # We need logits_f32[:, :, label] − global_max.
-    # Gather one f32[B,T,CHUNK_SIZE] slice, then pick the token position.
-    # dynamic_slice_in_dim requires a scalar start; use a scan over the unique
-    # chunk indices.  Because NUM_CHUNKS=32 the scan is cheap and avoids a
-    # gather over the full vocab dimension.
     def gather_body(carry, chunk_idx):
-        # carry: f32[B,T] — the target-token logit (updated only where
-        #        chunk_ids == chunk_idx, else left unchanged)
-        target_logit = carry
-        start  = chunk_idx * CHUNK_SIZE
-        chunk  = jax.lax.dynamic_slice_in_dim(
-            logits_f32, start, CHUNK_SIZE, axis=-1)            # [B, T, CHUNK_SIZE]
-        # gather token_ids position inside this chunk
-        tok    = jnp.take_along_axis(chunk, token_ids[..., None], axis=-1)[..., 0]  # [B,T]
-        # only write where this chunk is the correct one
-        mask   = (chunk_ids == chunk_idx)                       # [B, T] bool
-        return jnp.where(mask, tok, target_logit), None
+        start = chunk_idx * CHUNK_SIZE
+        chunk = jax.lax.dynamic_slice_in_dim(logits_f32, start, CHUNK_SIZE, axis=-1)
+        tok   = jnp.take_along_axis(chunk, token_ids[..., None], axis=-1)[..., 0]
+        mask  = (chunk_ids == chunk_idx)
+        return jnp.where(mask, tok, carry), None
 
     target_logit, _ = jax.lax.scan(
         gather_body,
         jnp.zeros((B, T), dtype=jnp.float32),
         jnp.arange(NUM_CHUNKS, dtype=jnp.int32),
-    )  # [B, T]
+    )
 
-    # ── final NLL ─────────────────────────────────────────────────────────────
     log_prob = (target_logit - global_max) - jnp.log(sum_exp + 1e-8)
     return -log_prob   # float32 [B, T]
 
 
-# FIX 15(b): @jax.checkpoint removed from compute_mtp_loss.
-# Previously, checkpointing this function caused XLA to RECOMPUTE the entire
-# chunked_cross_entropy during the backward pass, re-expanding the large f32
-# logit tensor.  We instead apply jax.checkpoint surgically on model.apply so
-# transformer block activations are still rematerialised, but CE intermediates
-# (now tiny ~56 MB per chunk) are NOT forced to be recomputed.
-def compute_mtp_loss(params, batch, dropout_rng):
+# ════════════════════════════════════════════════════════════════════════════════
+# §10  MTP LOSS + PMAP STEPS
+#
+# FIX 16: InvalidFilterError from jax.checkpoint(model.apply)(..., mutable=False)
+# ─────────────────────────────────────────────────────────────────────────────
+# PROBLEM:
+#   When JAX traces jax.checkpoint(model.apply), every argument — including
+#   keyword arguments like mutable=False — passes through JAX's abstract
+#   evaluation. The Python bool False becomes a JitTracer(bool[]).
+#   Flax's scope.in_filter() is called at trace time with this traced value,
+#   but it only handles real Python bool/str/DenyList, so it raises:
+#       InvalidFilterError: Invalid Filter: "JitTracer(bool[])"
+#
+# FIX:
+#   Define a plain Python helper _fwd(params, batch, dropout_rng) that calls
+#   model.apply with mutable as a hard-coded Python literal — never a traced
+#   value. Apply jax.checkpoint to _fwd instead of model.apply.
+#   The checkpoint boundary (and therefore rematerialisation behaviour) is
+#   exactly the same as before, but Flax only ever sees real Python bools. ✓
+# ════════════════════════════════════════════════════════════════════════════════
+
+def _fwd(params, batch, dropout_rng):
     """
-    Compute MTP loss in a streaming, memory-friendly manner.
-    - params: model params
-    - batch:  int32 [B, T]
-    - dropout_rng: PRNGKey (typed or legacy)
-    Returns scalar float32 loss (averaged and weighted across MTP heads).
+    Pure Python wrapper around model.apply for training.
+    All keyword args (train=True, mutable=False) are Python literals —
+    they are resolved at Python import time, never touched by JAX's tracer.
+    This is the function that jax.checkpoint wraps.
     """
-    # Surgical checkpoint: rematerialise transformer activations only.
-    # This is equivalent to the old @jax.checkpoint on the whole function but
-    # does NOT force chunked_cross_entropy to recompute during backward. ✓
-    logits_list = jax.checkpoint(model.apply)(
+    return model.apply(
         {"params": params},
         input_ids=batch,
         train=True,
         rngs={"dropout": dropout_rng},
-        mutable=False,
+        # mutable is intentionally NOT passed: Flax defaults to mutable=False
+        # for stateless modules, which is what we want. No traced bool ever
+        # reaches in_filter(). ✓
     )
+
+
+# jax.checkpoint(_fwd): transformer block activations are rematerialised
+# during the backward pass; CE intermediates (tiny ~56 MB) are not. ✓
+_fwd_checkpointed = jax.checkpoint(_fwd)
+
+
+def compute_mtp_loss(params, batch, dropout_rng):
+    """
+    MTP loss: weighted sum over t+1, t+2, t+3 prediction heads.
+    params      : model params pytree
+    batch       : int32 [B, T]
+    dropout_rng : PRNGKey
+    Returns     : scalar float32 loss
+    """
+    logits_list = _fwd_checkpointed(params, batch, dropout_rng)
 
     total_loss   = 0.0
     total_weight = 0.0
@@ -752,10 +672,10 @@ def compute_mtp_loss(params, batch, dropout_rng):
         if clip_len <= 0:
             continue
 
-        logits_slice = logits[:, :clip_len, :]                        # bf16 [B, clip_len, V]
-        labels_slice = batch[:, offset:offset + clip_len].astype(jnp.int32)  # [B, clip_len]
+        logits_slice = logits[:, :clip_len, :]
+        labels_slice = batch[:, offset:offset + clip_len].astype(jnp.int32)
 
-        nll = chunked_cross_entropy(logits_slice, labels_slice)       # float32 [B, clip_len]
+        nll = chunked_cross_entropy(logits_slice, labels_slice)
 
         mask           = labels_slice != PAD_ID
         masked_nll_sum = jnp.where(mask, nll, 0.0).sum()
@@ -768,16 +688,15 @@ def compute_mtp_loss(params, batch, dropout_rng):
     return (total_loss / (total_weight + 1e-12)).astype(jnp.float32)
 
 
-# PMAPed training step with gradient accumulation inside pmap.
 @partial(jax.pmap, axis_name="devices", donate_argnums=(0,))
 def train_step_accum(state, micro_batches, dropout_rngs):
     """
-    micro_batches: [GRAD_ACCUM, PER_CORE_BATCH, SEQ_LEN] (per-device shard)
-    dropout_rngs:  [GRAD_ACCUM] typed PRNGKey array (per-device)
+    micro_batches: [GRAD_ACCUM, PER_CORE_BATCH, SEQ_LEN] per-device shard
+    dropout_rngs : [GRAD_ACCUM] typed PRNGKey array per-device
     """
     def accum_fn(carry, inputs):
         grads_acc, loss_acc = carry
-        mb, rng = inputs  # mb: [PER_CORE_BATCH, SEQ_LEN]
+        mb, rng = inputs
         loss, grads = jax.value_and_grad(compute_mtp_loss)(state.params, mb, rng)
         grads_acc = jax.tree_util.tree_map(lambda a, b: a + b, grads_acc, grads)
         return (grads_acc, loss_acc + loss), None
@@ -797,19 +716,17 @@ def train_step_accum(state, micro_batches, dropout_rngs):
     return new_state, avg_loss, grad_norm
 
 
-# PMAPed eval step using the chunked CE for stable memory usage.
 @partial(jax.pmap, axis_name="devices")
 def eval_step(params, batch):
     """
     batch: [PER_CORE_BATCH, SEQ_LEN] per-device shard
-    Returns averaged loss across devices (float32).
     """
     logits_list = model.apply({"params": params}, input_ids=batch, train=False)
-    logits = logits_list[0]                  # primary head (bf16) [B, T, V]
+    logits = logits_list[0]
     labels = batch[:, 1:].astype(jnp.int32)
-    logits = logits[:, :-1, :]               # align with labels [B, T-1, V]
+    logits = logits[:, :-1, :]
 
-    nll  = chunked_cross_entropy(logits, labels)   # [B, T-1]
+    nll  = chunked_cross_entropy(logits, labels)
     mask = labels != PAD_ID
     loss = jnp.where(mask, nll, 0.0).sum() / (mask.sum() + 1e-8)
     return jax.lax.pmean(loss, axis_name="devices")
@@ -822,7 +739,6 @@ CODE_LANGS = [
     "python", "javascript", "typescript", "java", "c", "cpp", "c-sharp",
     "go", "rust", "kotlin", "php", "ruby", "shell", "sql", "html", "css",
     "markdown", "yaml", "json", "dockerfile", "cuda", "r", "dart", "swift",
-    # "scala" excluded per tokenizer note
 ]
 
 
@@ -895,7 +811,6 @@ def stream_code(target_bytes: int, seed: int, skip_tokens: int = 0):
 
 
 def stream_english(target_bytes: int, seed: int, skip_tokens: int = 0):
-    """Full FineWeb-Edu default split (~1.3T tokens), score >= 3.0 filter."""
     log.info(f"[ENG] fineweb-edu | target={target_bytes/1e9:.2f}GB | skip={skip_tokens:,} tokens | seed={seed}")
     ds = load_dataset(
         "HuggingFaceFW/fineweb-edu",
@@ -924,21 +839,6 @@ def stream_english(target_bytes: int, seed: int, skip_tokens: int = 0):
 
 
 def combined_stream(resume_step: int, seed: int):
-    """
-    Weighted interleaved stream. Mix: 40% math | 40% code | 20% english.
-    Weighted cycle: [mathA, mathB, codeA, codeB, eng] → 2:2:1 ratio.
-
-    Each slot is an INDEPENDENT generator instance:
-    - mathA / mathB use seed and seed+1 (different shuffles of same dataset).
-    - codeA / codeB use seed+2 and seed+3 (code is a different dataset so
-      seed integer correlation with math seeds is irrelevant, but we space
-      them anyway for absolute clarity).
-    - Each slot gets half the modality byte budget so the two slots combined
-      consume the full math_bytes / code_bytes target.
-    - Skip tokens are split evenly between the two slots of each modality.
-      Integer truncation is at most 1 token per slot per resume — negligible
-      at 150B token scale (< 1e-10 fractional error).
-    """
     total_bytes  = TOTAL_TOKENS * 2
     math_bytes   = int(total_bytes * MATH_RATIO)
     code_bytes   = int(total_bytes * CODE_RATIO)
@@ -950,11 +850,11 @@ def combined_stream(resume_step: int, seed: int):
     eng_skip     = int(tokens_done * ENG_RATIO)
 
     cycle = [
-        stream_math(math_bytes // 2, seed,     math_skip // 2),   # mathA
-        stream_math(math_bytes // 2, seed + 1, math_skip // 2),   # mathB  (distinct shuffle)
-        stream_code(code_bytes // 2, seed + 2, code_skip // 2),   # codeA
-        stream_code(code_bytes // 2, seed + 3, code_skip // 2),   # codeB  (distinct shuffle)
-        stream_english(eng_bytes,    seed + 4, eng_skip),         # eng
+        stream_math(math_bytes // 2, seed,     math_skip // 2),
+        stream_math(math_bytes // 2, seed + 1, math_skip // 2),
+        stream_code(code_bytes // 2, seed + 2, code_skip // 2),
+        stream_code(code_bytes // 2, seed + 3, code_skip // 2),
+        stream_english(eng_bytes,    seed + 4, eng_skip),
     ]
     done  = [False] * 5
     idx   = 0
@@ -1122,10 +1022,7 @@ if val_batches_loaded is not None:
     log.info(f"✓ Val set from checkpoint: {val_batches.shape}")
 else:
     log.info(f"Building validation set ({VAL_BATCHES_N} batches)...")
-    # Target 3× the needed tokens to ensure we always have enough.
-    # VAL_BATCHES_N * MICRO_BATCH * MAX_SEQ_LEN = 128 * 8 * 16384 = 16,777,216 tokens.
-    # 3× target = ~50M tokens — vastly exceeds the stream budget, so no underflow.
-    _val_need = VAL_BATCHES_N * MICRO_BATCH   # 1024 blocks
+    _val_need = VAL_BATCHES_N * MICRO_BATCH
     val_gen = stream_english(
         target_bytes=_val_need * MAX_SEQ_LEN * 3 * 2,
         seed=GLOBAL_SEED + 9999,
@@ -1137,7 +1034,6 @@ else:
         except StopIteration:
             break
 
-    # FIX 12: Hard guard — fail loudly if the stream didn't produce enough blocks.
     if len(val_list) < _val_need:
         raise RuntimeError(
             f"Val set underflow: got {len(val_list)} blocks, need {_val_need}. "
@@ -1174,8 +1070,6 @@ t_start     = time.time()
 
 try:
     while global_step < MAX_STEPS:
-        # Collect GRAD_ACCUM * MICRO_BATCH blocks for this step.
-        # With PER_CORE_BATCH=1, MICRO_BATCH=8, GRAD_ACCUM=32: 256 blocks total.
         step_blocks = []
         for _ in range(GRAD_ACCUM * MICRO_BATCH):
             block = prefetch_q.get()
@@ -1187,28 +1081,17 @@ try:
         if len(step_blocks) < GRAD_ACCUM * MICRO_BATCH:
             break
 
-        # Reshape [256, SEQ_LEN] → [TPU_CORES, GRAD_ACCUM, PER_CORE_BATCH, SEQ_LEN]
-        # = [8, 32, 1, 16384]. TPU_CORES_STATIC is a Python int literal →
-        # XLA sees a compile-time constant; no dynamic shape / recompile risk.
         arr = np.array(step_blocks, dtype=np.int32)
         arr = arr.reshape(GRAD_ACCUM, TPU_CORES_STATIC, PER_CORE_BATCH, MAX_SEQ_LEN)
         arr = arr.transpose(1, 0, 2, 3)  # [8, 32, 1, 16384]
         arr = jnp.asarray(arr, dtype=jnp.int32)
 
-        # Pure jrand.split RNG: no key_data/wrap_key_data needed.
-        # jrand.split(key, n) returns a typed key array [n].
-        # pmap shards axis-0 → each device gets [GRAD_ACCUM] keys.
-        # lax.scan iterates axis-0 → each micro-step gets one unique PRNGKey.
         rng, step_rng = jrand.split(rng)
-
         all_keys = jrand.split(step_rng, TPU_CORES_STATIC * GRAD_ACCUM)
 
-        # Handle both typed-key and legacy (N,2) key formats safely
         if all_keys.ndim == 1:
-            # Typed PRNG keys (JAX >= 0.4.16 new format)
             dropout_rngs = all_keys.reshape(TPU_CORES_STATIC, GRAD_ACCUM)
         else:
-            # Legacy 2-int keys
             dropout_rngs = all_keys.reshape(TPU_CORES_STATIC, GRAD_ACCUM, 2)
 
         state, loss, grad_norm = train_step_accum(state, arr, dropout_rngs)
@@ -1238,8 +1121,6 @@ try:
             log.info(f"[EVAL] Running validation at step {global_step}...")
             val_losses = []
             for vb in val_batches:
-                # vb: [MICRO_BATCH, SEQ_LEN] = [8, 16384]
-                # reshape to [TPU_CORES, PER_CORE_BATCH, SEQ_LEN] = [8, 1, 16384]
                 vb_sharded = jnp.asarray(vb, dtype=jnp.int32).reshape(
                     TPU_CORES_STATIC, PER_CORE_BATCH, MAX_SEQ_LEN
                 )
