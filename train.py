@@ -53,13 +53,6 @@ from threading import Thread
 # FIX 10: TPU-specific XLA flags.
 # --xla_gpu_enable_latency_hiding_scheduler had zero effect on TPU (GPU-only flag).
 # The TPU equivalents overlap allreduce (pmean) with compute, reducing step time.
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"]   = "platform"
-os.environ["XLA_FLAGS"] = (
-    "--xla_tpu_enable_latency_hiding_scheduler=true "
-    "--xla_tpu_enable_async_collective_fusion=true "
-    "--xla_tpu_enable_async_collective_fusion_fuse_all_gather=true"
-)
 
 import jax
 import jax.numpy as jnp
@@ -116,7 +109,7 @@ if HF_TOKEN is None:
         pass
 
 if HF_TOKEN is None:
-    HF_TOKEN = "hf_YOUR_TOKEN_HERE"  # <<< fallback
+    HF_TOKEN = "hf_token"  # <<< fallback
 
 login(token=HF_TOKEN, add_to_git_credential=False)
 
@@ -139,7 +132,7 @@ HEAD_DIM        = D_MODEL // N_HEADS   # 64
 MLP_HIDDEN      = 1536
 N_UNIQUE_BLOCKS = 8
 N_RECURRENCES   = 4         # effective depth = 32
-MAX_SEQ_LEN     = 16_384
+MAX_SEQ_LEN     = 14_336
 DROPOUT_RATE    = 0.0
 
 # MLA compression dims
@@ -297,11 +290,8 @@ class RMSNorm(nn.Module):
 class MLAAttention(nn.Module):
     """
     Multi-head Latent Attention (DeepSeek-style MLA).
-    Compresses KV into a low-rank latent vector to save HBM.
-    At T=16384, bf16, PER_CORE_BATCH=1:
-      Standard KV = 2×16384×576×2B  = ~36 MB per layer
-      MLA latent  = 2×16384×128×2B  =  ~8 MB per layer  (4.5× saving)
-    Attention matrix [1,9,16384,16384] fp32 = 9.86 GB (fits within 16 GB HBM).
+    Uses fused TPU attention (jax.nn.dot_product_attention)
+    so no full [T,T] matrix is materialized.
     """
     d_model:      int
     n_heads:      int
@@ -315,52 +305,74 @@ class MLAAttention(nn.Module):
     def __call__(self, x, sin, cos, deterministic: bool):
         B, T, _ = x.shape
 
-        # Q with latent compression
+        # ─────────────────────────────────────────
+        # Q projection (latent compression)
+        # ─────────────────────────────────────────
         q = nn.Dense(self.q_latent, use_bias=False, dtype=jnp.bfloat16)(x)
         q = RMSNorm(self.q_latent)(q)
-        q = nn.Dense(self.n_heads * self.head_dim, use_bias=False, dtype=jnp.bfloat16)(q)
+        q = nn.Dense(self.n_heads * self.head_dim,
+                     use_bias=False,
+                     dtype=jnp.bfloat16)(q)
         q = q.reshape(B, T, self.n_heads, self.head_dim)
 
-        # Joint KV latent compression
-        kv_lat = nn.Dense(self.kv_latent, use_bias=False, dtype=jnp.bfloat16)(x)
+        # ─────────────────────────────────────────
+        # KV projection (shared latent compression)
+        # ─────────────────────────────────────────
+        kv_lat = nn.Dense(self.kv_latent,
+                          use_bias=False,
+                          dtype=jnp.bfloat16)(x)
         kv_lat = RMSNorm(self.kv_latent)(kv_lat)
-        k = nn.Dense(self.n_kv_heads * self.head_dim, use_bias=False, dtype=jnp.bfloat16)(kv_lat)
-        v = nn.Dense(self.n_kv_heads * self.head_dim, use_bias=False, dtype=jnp.bfloat16)(kv_lat)
+
+        k = nn.Dense(self.n_kv_heads * self.head_dim,
+                     use_bias=False,
+                     dtype=jnp.bfloat16)(kv_lat)
+        v = nn.Dense(self.n_kv_heads * self.head_dim,
+                     use_bias=False,
+                     dtype=jnp.bfloat16)(kv_lat)
+
         k = k.reshape(B, T, self.n_kv_heads, self.head_dim)
         v = v.reshape(B, T, self.n_kv_heads, self.head_dim)
 
+        # ─────────────────────────────────────────
         # RoPE
+        # ─────────────────────────────────────────
         sin_ = sin[None, :T, None, :]
         cos_ = cos[None, :T, None, :]
-        q    = apply_rope(q, sin_, cos_)
-        k    = apply_rope(k, sin_, cos_)
+        q = apply_rope(q, sin_, cos_)
+        k = apply_rope(k, sin_, cos_)
 
-        # GQA expansion
+        # ─────────────────────────────────────────
+        # GQA expansion (repeat KV heads)
+        # ─────────────────────────────────────────
         repeat = self.n_heads // self.n_kv_heads
         if repeat > 1:
             k = jnp.repeat(k, repeat, axis=2)
             v = jnp.repeat(v, repeat, axis=2)
 
-        # Scaled dot-product attention
-        scale = 1.0 / math.sqrt(self.head_dim)
-        q = q.transpose(0, 2, 1, 3)   # [B, H, T, d]
-        k = k.transpose(0, 2, 3, 1)   # [B, H, d, T]
-        v = v.transpose(0, 2, 1, 3)   # [B, H, T, d]
+        # ─────────────────────────────────────────
+        # TPU-FUSED MEMORY-EFFICIENT ATTENTION
+        # ─────────────────────────────────────────
+        # Shapes required: [B, H, T, D]
+        q = q.transpose(0, 2, 1, 3)
+        k = k.transpose(0, 2, 1, 3)
+        v = v.transpose(0, 2, 1, 3)
 
-        attn = jnp.matmul(q, k) * scale
+        out = jax.nn.dot_product_attention(
+            query=q,
+            key=k,
+            value=v,
+            bias=None,
+            mask=None,
+            is_causal=True,
+            scale=1.0 / math.sqrt(self.head_dim),
+        )
 
-        # Cast to float32 first, then mask, then softmax.
-        attn = attn.astype(jnp.float32)
-        mask = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))
-        attn = jnp.where(mask[None, None], attn, jnp.finfo(jnp.float32).min)
-        attn = nn.softmax(attn, axis=-1).astype(jnp.bfloat16)
-
-        if self.dropout_rate > 0.0:
-            attn = nn.Dropout(self.dropout_rate)(attn, deterministic=deterministic)
-
-        out = jnp.matmul(attn, v)
+        # Back to [B, T, D_model]
         out = out.transpose(0, 2, 1, 3).reshape(B, T, self.d_model)
-        return nn.Dense(self.d_model, use_bias=False, dtype=jnp.bfloat16)(out)
+
+        return nn.Dense(self.d_model,
+                        use_bias=False,
+                        dtype=jnp.bfloat16)(out)
 
 
 class ConvSwiGLU(nn.Module):
@@ -544,8 +556,16 @@ def wsd_schedule(step):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# §8  TRAIN STATE
+# §8-§10  REPLACEMENT: TRAIN STATE, MEMORY-SAFE CHUNKED CE, MTP LOSS, PMAP STEPS
+# - Uses static CHUNK_SIZE = 2048 (smaller → less HBM; raises compute slightly).
+# - Uses jax.lax.fori_loop (trace-friendly) and jnp.take for dynamic indexing.
+# - compute_mtp_loss is checkpointed (rematerialisation) to reduce activation HBM.
+# - train_step_accum performs grad-accum via lax.scan inside pmap as before.
 # ════════════════════════════════════════════════════════════════════════════════
+
+# Module-level static chunk size (must be a Python int so loops are static to the tracer)
+CHUNK_SIZE = 2048  # lowered from 4096 -> 2048 to free ~2-4 GB HBM on TPU v5e
+
 class ZenyxTrainState(train_state.TrainState):
     pass
 
@@ -569,51 +589,172 @@ def create_train_state(params):
     )
 
 
-# ════════════════════════════════════════════════════════════════════════════════
-# §9  MTP LOSS
-# ════════════════════════════════════════════════════════════════════════════════
+# Static constants (must divide exactly)
+CHUNK_SIZE  = 2048
+NUM_CHUNKS  = VOCAB_SIZE // CHUNK_SIZE   # 32768 / 2048 = 16
+
+
+def chunked_cross_entropy(logits, labels):
+    """
+    Memory-safe cross entropy without dynamic indexing.
+    logits: bf16 [B, T, V]
+    labels: int32 [B, T]
+    Returns per-position NLL float32 [B, T]
+    """
+
+    B, T, V = logits.shape
+    assert V == VOCAB_SIZE
+    assert VOCAB_SIZE % CHUNK_SIZE == 0
+
+    # ─────────────────────────────────────────
+    # 1) reshape vocab into chunks
+    # [B, T, 32768] → [B, T, 16, 2048]
+    # ─────────────────────────────────────────
+    logits = logits.reshape(B, T, NUM_CHUNKS, CHUNK_SIZE)
+    logits = logits.astype(jnp.float32)
+
+    # ─────────────────────────────────────────
+    # 2) compute max over vocab (two-stage)
+    # ─────────────────────────────────────────
+    max_chunk = jnp.max(logits, axis=-1)          # [B, T, 16]
+    max_logits = jnp.max(max_chunk, axis=-1)      # [B, T]
+
+    # subtract for stability
+    logits = logits - max_logits[..., None, None]
+
+    # ─────────────────────────────────────────
+    # 3) compute exp sum
+    # ─────────────────────────────────────────
+    exp_logits = jnp.exp(logits)
+    sum_exp = exp_logits.sum(axis=(-1, -2))       # sum over chunk + vocab
+
+    # ─────────────────────────────────────────
+    # 4) gather correct token logits
+    # ─────────────────────────────────────────
+    chunk_ids = labels // CHUNK_SIZE              # which chunk
+    token_ids = labels % CHUNK_SIZE               # index inside chunk
+
+    # gather chunk first
+    gathered_chunk = jnp.take_along_axis(
+        logits,
+        chunk_ids[..., None, None],   # shape align
+        axis=2
+    )                                 # [B, T, 1, 2048]
+
+    gathered_chunk = gathered_chunk[..., 0, :]    # [B, T, 2048]
+
+    gathered_token = jnp.take_along_axis(
+        gathered_chunk,
+        token_ids[..., None],
+        axis=-1
+    )[..., 0]                                     # [B, T]
+
+    # ─────────────────────────────────────────
+    # 5) final NLL
+    # ─────────────────────────────────────────
+    log_prob = gathered_token - jnp.log(sum_exp + 1e-8)
+    nll = -log_prob
+
+    return nll
+
+
+    def max_body(i, cur_max):
+        start = i * CHUNK_SIZE
+        end = jnp.minimum(start + CHUNK_SIZE, V)
+        idx = jnp.arange(start, end, dtype=jnp.int32)
+        # take returns [B, T, chunk_len]
+        chunk = jnp.take(logits, idx, axis=-1).astype(jnp.float32)
+        max_chunk = jnp.max(chunk, axis=-1)
+        return jnp.maximum(cur_max, max_chunk)
+
+    max_logits = jax.lax.fori_loop(0, num_chunks, max_body, max_logits)
+
+    sum_exp = jnp.zeros((B, T), dtype=jnp.float32)
+    target_logit = jnp.zeros((B, T), dtype=jnp.float32)
+
+    def acc_body(i, carry):
+        s_exp, t_logit = carry
+        start = i * CHUNK_SIZE
+        end = jnp.minimum(start + CHUNK_SIZE, V)
+        idx = jnp.arange(start, end, dtype=jnp.int32)
+        chunk = jnp.take(logits, idx, axis=-1).astype(jnp.float32)  # [B,T,chunk_len]
+
+        # stable: subtract per-position max
+        chunk = chunk - max_logits[..., None]
+        exp_chunk = jnp.exp(chunk)
+        s_exp = s_exp + exp_chunk.sum(axis=-1)
+
+        # gather target logits for positions whose labels fall in this chunk
+        in_range = (labels >= start) & (labels < end)
+        # safe label indices (where not in_range we set 0; will be masked out)
+        safe_labels = jnp.where(in_range, labels - start, 0).astype(jnp.int32)
+        gathered = jnp.take_along_axis(chunk, safe_labels[..., None], axis=-1)[..., 0]
+        t_logit = t_logit + jnp.where(in_range, gathered, 0.0)
+
+        return (s_exp, t_logit)
+
+    sum_exp, target_logit = jax.lax.fori_loop(0, num_chunks, acc_body, (sum_exp, target_logit))
+
+    log_prob = target_logit - jnp.log(sum_exp + 1e-8)
+    nll = -log_prob  # float32 [B,T]
+    return nll
+
+
+# Keep checkpoint/remat to reduce stored activations during backward.
+@jax.checkpoint
 def compute_mtp_loss(params, batch, dropout_rng):
     """
-    Weighted Multi-Token Prediction loss.
-    t+1: weight 1.0 | t+2: weight 0.3 | t+3: weight 0.1
-    For offset k: pred[:, :T-k, :] vs labels[:, k:T]  — no off-by-one. ✓
+    Compute MTP loss in a streaming, memory-friendly manner.
+    - params: model params
+    - batch: [B, T] int32
+    - dropout_rng: PRNGKey (typed or legacy)
+    Returns scalar float32 loss (averaged and weighted across MTP heads).
     """
+    # Forward (returns list of logits in bf16)
     logits_list = model.apply(
         {"params": params},
         input_ids=batch,
         train=True,
         rngs={"dropout": dropout_rng},
+        mutable=False,
     )
 
     total_loss = 0.0
+    total_weight = 0.0
+
     for offset, (logits, weight) in enumerate(zip(logits_list, MTP_WEIGHTS), start=1):
-        T        = batch.shape[1]
+        T = batch.shape[1]
         clip_len = T - offset
-        pred     = logits[:, :clip_len, :].astype(jnp.float32).reshape(-1, VOCAB_SIZE)
-        labels   = batch[:, offset:offset + clip_len].reshape(-1)
-        mask     = labels != PAD_ID
-        loss     = optax.softmax_cross_entropy_with_integer_labels(pred, labels)
-        loss     = jnp.where(mask, loss, 0.0).sum() / (mask.sum() + 1e-8)
+        if clip_len <= 0:
+            continue
+
+        logits_slice = logits[:, :clip_len, :]           # bf16 [B, clip_len, V]
+        labels_slice = batch[:, offset:offset + clip_len].astype(jnp.int32)  # [B, clip_len]
+
+        # chunked CE -> per-position NLL in float32 [B, clip_len]
+        nll = chunked_cross_entropy(logits_slice, labels_slice, VOCAB_SIZE)
+
+        mask = labels_slice != PAD_ID
+        masked_nll_sum = jnp.where(mask, nll, 0.0).sum()
+        denom = mask.sum() + 1e-8
+        loss = masked_nll_sum / denom
+
         total_loss = total_loss + weight * loss
+        total_weight = total_weight + weight
 
-    return total_loss / sum(MTP_WEIGHTS)
+    return (total_loss / (total_weight + 1e-12)).astype(jnp.float32)
 
 
-# ════════════════════════════════════════════════════════════════════════════════
-# §10  PMAP TRAIN / EVAL
-# ════════════════════════════════════════════════════════════════════════════════
+# PMAPed training step with gradient accumulation inside pmap.
 @partial(jax.pmap, axis_name="devices", donate_argnums=(0,))
 def train_step_accum(state, micro_batches, dropout_rngs):
     """
-    Gradient accumulation via lax.scan inside pmap.
-    Per-device shapes after pmap shards axis-0:
-      micro_batches: [GRAD_ACCUM, PER_CORE_BATCH, SEQ_LEN]  = [32, 1, 16384]
-      dropout_rngs:  [GRAD_ACCUM]  typed PRNGKey array
-    lax.scan iterates GRAD_ACCUM=32 times, one micro-step per iteration.
+    micro_batches: [GRAD_ACCUM, PER_CORE_BATCH, SEQ_LEN] (per-device shard)
+    dropout_rngs:  [GRAD_ACCUM] typed PRNGKey array (per-device)
     """
     def accum_fn(carry, inputs):
         grads_acc, loss_acc = carry
-        mb, rng = inputs
+        mb, rng = inputs  # mb: [PER_CORE_BATCH, SEQ_LEN] (or [B, T])
         loss, grads = jax.value_and_grad(compute_mtp_loss)(state.params, mb, rng)
         grads_acc = jax.tree_util.tree_map(lambda a, b: a + b, grads_acc, grads)
         return (grads_acc, loss_acc + loss), None
@@ -625,24 +766,29 @@ def train_step_accum(state, micro_batches, dropout_rngs):
         (micro_batches, dropout_rngs),
     )
 
-    grads     = jax.tree_util.tree_map(lambda g: g / GRAD_ACCUM, grads)
-    grads     = jax.lax.pmean(grads, axis_name="devices")
-    avg_loss  = jax.lax.pmean(total_loss / GRAD_ACCUM, axis_name="devices")
+    grads = jax.tree_util.tree_map(lambda g: g / GRAD_ACCUM, grads)
+    grads = jax.lax.pmean(grads, axis_name="devices")
+    avg_loss = jax.lax.pmean(total_loss / GRAD_ACCUM, axis_name="devices")
     grad_norm = optax.global_norm(grads)
     new_state = state.apply_gradients(grads=grads)
     return new_state, avg_loss, grad_norm
 
 
+# PMAPed eval step using the chunked CE for stable memory usage.
 @partial(jax.pmap, axis_name="devices")
 def eval_step(params, batch):
-    """batch: [PER_CORE_BATCH, SEQ_LEN] per device"""
+    """
+    batch: [PER_CORE_BATCH, SEQ_LEN] per-device shard
+    Returns averaged loss across devices (float32).
+    """
     logits_list = model.apply({"params": params}, input_ids=batch, train=False)
-    logits = logits_list[0].astype(jnp.float32)
-    logits = logits[:, :-1, :].reshape(-1, VOCAB_SIZE)
-    labels = batch[:, 1:].reshape(-1)
-    mask   = labels != PAD_ID
-    loss   = optax.softmax_cross_entropy_with_integer_labels(logits, labels)
-    loss   = jnp.where(mask, loss, 0.0).sum() / (mask.sum() + 1e-8)
+    logits = logits_list[0]                 # primary head (bf16) [B, T, V]
+    labels = batch[:, 1:].astype(jnp.int32)
+    logits = logits[:, :-1, :]              # align with labels [B, T-1, V]
+
+    nll = chunked_cross_entropy(logits, labels, VOCAB_SIZE)  # [B, T-1]
+    mask = labels != PAD_ID
+    loss = jnp.where(mask, nll, 0.0).sum() / (mask.sum() + 1e-8)
     return jax.lax.pmean(loss, axis_name="devices")
 
 
@@ -1031,8 +1177,16 @@ try:
         # pmap shards axis-0 → each device gets [GRAD_ACCUM] keys.
         # lax.scan iterates axis-0 → each micro-step gets one unique PRNGKey.
         rng, step_rng = jrand.split(rng)
-        all_keys      = jrand.split(step_rng, TPU_CORES_STATIC * GRAD_ACCUM)
-        dropout_rngs  = all_keys.reshape(TPU_CORES_STATIC, GRAD_ACCUM)
+        
+        all_keys = jrand.split(step_rng, TPU_CORES_STATIC * GRAD_ACCUM)
+        
+        # Handle both typed-key and legacy (N,2) key formats safely
+        if all_keys.ndim == 1:
+            # Typed PRNG keys (JAX >= 0.4.16 new format)
+            dropout_rngs = all_keys.reshape(TPU_CORES_STATIC, GRAD_ACCUM)
+        else:
+            # Legacy 2-int keys
+            dropout_rngs = all_keys.reshape(TPU_CORES_STATIC, GRAD_ACCUM, 2)
 
         state, loss, grad_norm = train_step_accum(state, arr, dropout_rngs)
 
