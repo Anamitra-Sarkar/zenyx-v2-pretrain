@@ -38,6 +38,18 @@
 #        Replaced with TPU-specific flags that overlap allreduce with compute.
 # Fix 11 [LOW]    JAX version guard: typed PRNG keys require JAX >= 0.4.16.
 # Fix 12 [LOW]    Val set underflow guard: fail loudly instead of silent reshape.
+#
+# ── FIXES (v2.4) ──────────────────────────────────────────────────────────────
+# Fix 13 [CRITICAL] chunked_cross_entropy() called with 3 args (logits, labels,
+#         VOCAB_SIZE) in compute_mtp_loss and eval_step, but the function only
+#         accepts 2 positional args (logits, labels). VOCAB_SIZE is already
+#         captured from module scope inside the function. Removed the spurious
+#         third argument at both call sites. ✓
+# Fix 14 [MEDIUM]  Dead fori_loop code block after `return nll` inside
+#         chunked_cross_entropy was unreachable but syntactically present,
+#         referencing an out-of-scope variable `V` (undefined at module level).
+#         Although Python never executes code after a return, having it confuses
+#         linters, future edits, and static checkers. Removed entirely. ✓
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -558,13 +570,10 @@ def wsd_schedule(step):
 # ════════════════════════════════════════════════════════════════════════════════
 # §8-§10  REPLACEMENT: TRAIN STATE, MEMORY-SAFE CHUNKED CE, MTP LOSS, PMAP STEPS
 # - Uses static CHUNK_SIZE = 2048 (smaller → less HBM; raises compute slightly).
-# - Uses jax.lax.fori_loop (trace-friendly) and jnp.take for dynamic indexing.
+# - Uses reshape + take_along_axis (XLA-friendly static shapes, no fori_loop).
 # - compute_mtp_loss is checkpointed (rematerialisation) to reduce activation HBM.
 # - train_step_accum performs grad-accum via lax.scan inside pmap as before.
 # ════════════════════════════════════════════════════════════════════════════════
-
-# Module-level static chunk size (must be a Python int so loops are static to the tracer)
-CHUNK_SIZE = 2048  # lowered from 4096 -> 2048 to free ~2-4 GB HBM on TPU v5e
 
 class ZenyxTrainState(train_state.TrainState):
     pass
@@ -590,8 +599,8 @@ def create_train_state(params):
 
 
 # Static constants (must divide exactly)
-CHUNK_SIZE  = 2048
-NUM_CHUNKS  = VOCAB_SIZE // CHUNK_SIZE   # 32768 / 2048 = 16
+CHUNK_SIZE  = 2048                         # lowered from 4096 → 2048 to free ~2-4 GB HBM
+NUM_CHUNKS  = VOCAB_SIZE // CHUNK_SIZE     # 32768 / 2048 = 16
 
 
 def chunked_cross_entropy(logits, labels):
@@ -600,8 +609,10 @@ def chunked_cross_entropy(logits, labels):
     logits: bf16 [B, T, V]
     labels: int32 [B, T]
     Returns per-position NLL float32 [B, T]
-    """
 
+    FIX 13: This function takes exactly 2 positional args (logits, labels).
+    VOCAB_SIZE is read from module scope — do NOT pass it as a third argument.
+    """
     B, T, V = logits.shape
     assert V == VOCAB_SIZE
     assert VOCAB_SIZE % CHUNK_SIZE == 0
@@ -616,88 +627,44 @@ def chunked_cross_entropy(logits, labels):
     # ─────────────────────────────────────────
     # 2) compute max over vocab (two-stage)
     # ─────────────────────────────────────────
-    max_chunk = jnp.max(logits, axis=-1)          # [B, T, 16]
-    max_logits = jnp.max(max_chunk, axis=-1)      # [B, T]
+    max_chunk  = jnp.max(logits, axis=-1)      # [B, T, 16]
+    max_logits = jnp.max(max_chunk, axis=-1)   # [B, T]
 
-    # subtract for stability
+    # subtract for numerical stability
     logits = logits - max_logits[..., None, None]
 
     # ─────────────────────────────────────────
     # 3) compute exp sum
     # ─────────────────────────────────────────
     exp_logits = jnp.exp(logits)
-    sum_exp = exp_logits.sum(axis=(-1, -2))       # sum over chunk + vocab
+    sum_exp    = exp_logits.sum(axis=(-1, -2))  # sum over chunks + vocab positions
 
     # ─────────────────────────────────────────
     # 4) gather correct token logits
     # ─────────────────────────────────────────
-    chunk_ids = labels // CHUNK_SIZE              # which chunk
-    token_ids = labels % CHUNK_SIZE               # index inside chunk
+    chunk_ids = labels // CHUNK_SIZE            # [B, T] — which chunk
+    token_ids = labels % CHUNK_SIZE             # [B, T] — position inside chunk
 
-    # gather chunk first
+    # gather the target chunk: [B, T, 1, 2048]
     gathered_chunk = jnp.take_along_axis(
         logits,
-        chunk_ids[..., None, None],   # shape align
-        axis=2
-    )                                 # [B, T, 1, 2048]
+        chunk_ids[..., None, None],
+        axis=2,
+    )                                           # [B, T, 1, 2048]
+    gathered_chunk = gathered_chunk[..., 0, :] # [B, T, 2048]
 
-    gathered_chunk = gathered_chunk[..., 0, :]    # [B, T, 2048]
-
+    # gather the target token within the chunk: [B, T]
     gathered_token = jnp.take_along_axis(
         gathered_chunk,
         token_ids[..., None],
-        axis=-1
-    )[..., 0]                                     # [B, T]
+        axis=-1,
+    )[..., 0]                                   # [B, T]
 
     # ─────────────────────────────────────────
-    # 5) final NLL
+    # 5) final NLL  (float32 [B, T])
     # ─────────────────────────────────────────
     log_prob = gathered_token - jnp.log(sum_exp + 1e-8)
-    nll = -log_prob
-
-    return nll
-
-
-    def max_body(i, cur_max):
-        start = i * CHUNK_SIZE
-        end = jnp.minimum(start + CHUNK_SIZE, V)
-        idx = jnp.arange(start, end, dtype=jnp.int32)
-        # take returns [B, T, chunk_len]
-        chunk = jnp.take(logits, idx, axis=-1).astype(jnp.float32)
-        max_chunk = jnp.max(chunk, axis=-1)
-        return jnp.maximum(cur_max, max_chunk)
-
-    max_logits = jax.lax.fori_loop(0, num_chunks, max_body, max_logits)
-
-    sum_exp = jnp.zeros((B, T), dtype=jnp.float32)
-    target_logit = jnp.zeros((B, T), dtype=jnp.float32)
-
-    def acc_body(i, carry):
-        s_exp, t_logit = carry
-        start = i * CHUNK_SIZE
-        end = jnp.minimum(start + CHUNK_SIZE, V)
-        idx = jnp.arange(start, end, dtype=jnp.int32)
-        chunk = jnp.take(logits, idx, axis=-1).astype(jnp.float32)  # [B,T,chunk_len]
-
-        # stable: subtract per-position max
-        chunk = chunk - max_logits[..., None]
-        exp_chunk = jnp.exp(chunk)
-        s_exp = s_exp + exp_chunk.sum(axis=-1)
-
-        # gather target logits for positions whose labels fall in this chunk
-        in_range = (labels >= start) & (labels < end)
-        # safe label indices (where not in_range we set 0; will be masked out)
-        safe_labels = jnp.where(in_range, labels - start, 0).astype(jnp.int32)
-        gathered = jnp.take_along_axis(chunk, safe_labels[..., None], axis=-1)[..., 0]
-        t_logit = t_logit + jnp.where(in_range, gathered, 0.0)
-
-        return (s_exp, t_logit)
-
-    sum_exp, target_logit = jax.lax.fori_loop(0, num_chunks, acc_body, (sum_exp, target_logit))
-
-    log_prob = target_logit - jnp.log(sum_exp + 1e-8)
-    nll = -log_prob  # float32 [B,T]
-    return nll
+    return -log_prob
 
 
 # Keep checkpoint/remat to reduce stored activations during backward.
@@ -719,27 +686,27 @@ def compute_mtp_loss(params, batch, dropout_rng):
         mutable=False,
     )
 
-    total_loss = 0.0
+    total_loss   = 0.0
     total_weight = 0.0
 
     for offset, (logits, weight) in enumerate(zip(logits_list, MTP_WEIGHTS), start=1):
-        T = batch.shape[1]
+        T        = batch.shape[1]
         clip_len = T - offset
         if clip_len <= 0:
             continue
 
-        logits_slice = logits[:, :clip_len, :]           # bf16 [B, clip_len, V]
+        logits_slice = logits[:, :clip_len, :]                        # bf16 [B, clip_len, V]
         labels_slice = batch[:, offset:offset + clip_len].astype(jnp.int32)  # [B, clip_len]
 
-        # chunked CE -> per-position NLL in float32 [B, clip_len]
-        nll = chunked_cross_entropy(logits_slice, labels_slice, VOCAB_SIZE)
+        # FIX 13: call with 2 args only — VOCAB_SIZE is module-level constant
+        nll = chunked_cross_entropy(logits_slice, labels_slice)       # float32 [B, clip_len]
 
-        mask = labels_slice != PAD_ID
+        mask           = labels_slice != PAD_ID
         masked_nll_sum = jnp.where(mask, nll, 0.0).sum()
-        denom = mask.sum() + 1e-8
-        loss = masked_nll_sum / denom
+        denom          = mask.sum() + 1e-8
+        loss           = masked_nll_sum / denom
 
-        total_loss = total_loss + weight * loss
+        total_loss   = total_loss   + weight * loss
         total_weight = total_weight + weight
 
     return (total_loss / (total_weight + 1e-12)).astype(jnp.float32)
@@ -754,7 +721,7 @@ def train_step_accum(state, micro_batches, dropout_rngs):
     """
     def accum_fn(carry, inputs):
         grads_acc, loss_acc = carry
-        mb, rng = inputs  # mb: [PER_CORE_BATCH, SEQ_LEN] (or [B, T])
+        mb, rng = inputs  # mb: [PER_CORE_BATCH, SEQ_LEN]
         loss, grads = jax.value_and_grad(compute_mtp_loss)(state.params, mb, rng)
         grads_acc = jax.tree_util.tree_map(lambda a, b: a + b, grads_acc, grads)
         return (grads_acc, loss_acc + loss), None
@@ -766,9 +733,9 @@ def train_step_accum(state, micro_batches, dropout_rngs):
         (micro_batches, dropout_rngs),
     )
 
-    grads = jax.tree_util.tree_map(lambda g: g / GRAD_ACCUM, grads)
-    grads = jax.lax.pmean(grads, axis_name="devices")
-    avg_loss = jax.lax.pmean(total_loss / GRAD_ACCUM, axis_name="devices")
+    grads     = jax.tree_util.tree_map(lambda g: g / GRAD_ACCUM, grads)
+    grads     = jax.lax.pmean(grads, axis_name="devices")
+    avg_loss  = jax.lax.pmean(total_loss / GRAD_ACCUM, axis_name="devices")
     grad_norm = optax.global_norm(grads)
     new_state = state.apply_gradients(grads=grads)
     return new_state, avg_loss, grad_norm
@@ -782,11 +749,12 @@ def eval_step(params, batch):
     Returns averaged loss across devices (float32).
     """
     logits_list = model.apply({"params": params}, input_ids=batch, train=False)
-    logits = logits_list[0]                 # primary head (bf16) [B, T, V]
+    logits = logits_list[0]                  # primary head (bf16) [B, T, V]
     labels = batch[:, 1:].astype(jnp.int32)
-    logits = logits[:, :-1, :]              # align with labels [B, T-1, V]
+    logits = logits[:, :-1, :]               # align with labels [B, T-1, V]
 
-    nll = chunked_cross_entropy(logits, labels, VOCAB_SIZE)  # [B, T-1]
+    # FIX 13: call with 2 args only
+    nll  = chunked_cross_entropy(logits, labels)   # [B, T-1]
     mask = labels != PAD_ID
     loss = jnp.where(mask, nll, 0.0).sum() / (mask.sum() + 1e-8)
     return jax.lax.pmean(loss, axis_name="devices")
@@ -1177,9 +1145,9 @@ try:
         # pmap shards axis-0 → each device gets [GRAD_ACCUM] keys.
         # lax.scan iterates axis-0 → each micro-step gets one unique PRNGKey.
         rng, step_rng = jrand.split(rng)
-        
+
         all_keys = jrand.split(step_rng, TPU_CORES_STATIC * GRAD_ACCUM)
-        
+
         # Handle both typed-key and legacy (N,2) key formats safely
         if all_keys.ndim == 1:
             # Typed PRNG keys (JAX >= 0.4.16 new format)
