@@ -21,9 +21,24 @@
 # Fix 3 [LOW]     MLAAttention softmax: cast to float32 BEFORE applying mask.
 #        Old: jnp.finfo(float32).min applied to bfloat16 attn then cast.
 #        New: cast to float32 first, then mask, then softmax. ✓
-# Fix 4 [MEDIUM]  Dropout RNG: key_data() + reshape → jrand.split nesting.
-#        Old: extracted raw uint32 key_data then passed to pmap (loses key type).
-#        New: pure JAX split → [TPU_CORES, GRAD_ACCUM, 2] PRNGKey array. ✓
+# Fix 4 [MEDIUM]  Dropout RNG: key_data() + wrap_key_data() → clean jrand.split.
+#        Old: extracted uint32 key_data on host, wrap_key_data inside pmap.
+#        New: jrand.split directly produces [TPU_CORES, GRAD_ACCUM] key array.
+#             No key_data/wrap_key_data needed — simpler and fully portable. ✓
+#
+# ── POST-AUDIT FIXES (v2.2) ───────────────────────────────────────────────────
+# Fix 5 [CRITICAL] combined_stream shared generator references.
+#        cycle = [gen_math, gen_math, ...] — slots 0 and 1 were THE SAME object.
+#        When slot 0 exhausts, slot 1 immediately exhausts too (same generator).
+#        Net result: math consumed once, not twice → 33/33/33 instead of 40/40/20.
+#        Fix: independent instances with distinct seeds per slot. ✓
+# Fix 6 [MEDIUM]  model.init dummy shape (1,64) → (1, MAX_SEQ_LEN).
+#        Init with T=64 compiled for that shape. First training step at T=16384
+#        triggered a full XLA recompile (expensive, minutes on TPU). ✓
+# Fix 7 [LOW]     TPU_CORES_STATIC assertion added.
+#        Silent shape mismatch if run on non-v5e-8 pod → now raises RuntimeError. ✓
+# Fix 8 [LOW]     YaRN denominator epsilon guard.
+#        Defensive jnp.where to prevent division by zero if YARN_ALPHA==YARN_BETA. ✓
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -123,14 +138,23 @@ MTP_WEIGHTS     = [1.0, 0.3, 0.1]
 log.info(f"JAX version: {jax.__version__}")
 log.info(f"JAX devices: {jax.devices()}")
 TPU_CORES = jax.device_count()
-if TPU_CORES != 8:
-    log.warning(f"Expected 8 TPU cores, got {TPU_CORES}. Adjusting batch sizes.")
+
+# FIX 7: Hard assert — fail loudly if not running on the expected v5e-8 pod.
+# TPU_CORES_STATIC is a Python int literal so XLA sees a compile-time constant
+# in all reshapes (no dynamic-shape recompile risk).
+TPU_CORES_STATIC = 8
+if TPU_CORES != TPU_CORES_STATIC:
+    raise RuntimeError(
+        f"Device count mismatch: jax.device_count()={TPU_CORES} but "
+        f"TPU_CORES_STATIC={TPU_CORES_STATIC}. "
+        "This script targets TPU v5e-8. Either run on the correct pod or "
+        "update TPU_CORES_STATIC to match your device count."
+    )
 
 PER_CORE_BATCH  = 2
 MICRO_BATCH     = PER_CORE_BATCH * TPU_CORES   # 16
 GRAD_ACCUM      = 16
 GLOBAL_BATCH    = MICRO_BATCH * GRAD_ACCUM     # 256
-TPU_CORES_STATIC = 8   # fixed for TPU v5e-8; used in static reshape to avoid XLA recompile
 
 log.info(f"TPU Cores: {TPU_CORES} | Per-core: {PER_CORE_BATCH} | "
          f"Micro-batch: {MICRO_BATCH} | Global: {GLOBAL_BATCH} seqs/step")
@@ -183,29 +207,34 @@ def build_yarn_rope_cache(seq_len: int, head_dim: int):
     YaRN (Yet another RoPE extensioN) scaled frequencies.
     Extends RoPE to 16k context from a 512 base window.
 
-    FIX 2: Corrected interpolation direction.
-    t = 0.0 at high-freq boundary (no scaling, keep as-is)
-    t = 1.0 at low-freq boundary  (full compression by YARN_SCALE_FACTOR)
-    Blends smoothly between them for mid-frequency dimensions.
+    Fix 2: Corrected interpolation direction.
+      t = 0.0 at high-freq boundary  → scale = 1.0       (no compression)
+      t = 1.0 at low-freq boundary   → scale = 1/factor  (full compression)
+    Fix 8: Epsilon guard in denominator to prevent division by zero if
+      YARN_ALPHA and YARN_BETA are accidentally set equal.
     """
     freqs = 1.0 / (ROPE_BASE ** (jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim))
     wavelengths = 2.0 * jnp.pi / freqs
 
-    low_boundary  = float(MAX_SEQ_LEN) / YARN_ALPHA   # > this → fully compressed
-    high_boundary = float(MAX_SEQ_LEN) / YARN_BETA     # < this → unchanged
+    low_boundary  = float(MAX_SEQ_LEN) / YARN_ALPHA   # 16384.0
+    high_boundary = float(MAX_SEQ_LEN) / YARN_BETA     # 512.0
+
+    # FIX 8: guard against accidental YARN_ALPHA == YARN_BETA (div-by-zero)
+    den = low_boundary - high_boundary  # 15872.0 with current params
+    den = jnp.where(den == 0.0, 1e-6, den)
 
     # t blends 0 (high-freq, unchanged) → 1 (low-freq, compressed)
-    t = (wavelengths - high_boundary) / (low_boundary - high_boundary)
+    t = (wavelengths - high_boundary) / den
     t = jnp.clip(t, 0.0, 1.0)
     intermediate_scale = (1.0 - t) * 1.0 + t * (1.0 / YARN_SCALE_FACTOR)
 
     scale = jnp.where(
         wavelengths > low_boundary,
-        1.0 / YARN_SCALE_FACTOR,          # fully compress long-range dims
+        1.0 / YARN_SCALE_FACTOR,
         jnp.where(
             wavelengths < high_boundary,
-            1.0,                           # keep short-range dims unchanged
-            intermediate_scale,            # smooth blend in between
+            1.0,
+            intermediate_scale,
         ),
     )
     freqs = freqs * scale
@@ -252,8 +281,7 @@ class MLAAttention(nn.Module):
       Standard KV = 2 × 16384 × 576 × 2B = ~36MB per layer
       MLA latent  = 2 × 16384 × 128 × 2B =  ~8MB per layer  (4.5× saving)
 
-    FIX 3: Cast attn to float32 BEFORE applying the causal mask fill value.
-    Old code applied jnp.finfo(float32).min to a bfloat16 tensor (bad practice).
+    Fix 3: Cast attn to float32 BEFORE applying the causal mask fill value.
     """
     d_model:      int
     n_heads:      int
@@ -299,11 +327,9 @@ class MLAAttention(nn.Module):
         k = k.transpose(0, 2, 3, 1)   # [B, H, d, T]
         v = v.transpose(0, 2, 1, 3)   # [B, H, T, d]
 
-        attn = jnp.matmul(q, k) * scale  # [B, H, T, T] in bfloat16
+        attn = jnp.matmul(q, k) * scale
 
-        # FIX 3: Cast to float32 BEFORE masking so fill value is exact.
-        # bfloat16 shares the same exponent range as float32, but it's
-        # bad practice to apply a float32 fill to a bf16 tensor.
+        # Fix 3: cast to float32 first, then mask, then softmax
         attn = attn.astype(jnp.float32)
         mask = jnp.tril(jnp.ones((T, T), dtype=jnp.bool_))
         attn = jnp.where(mask[None, None], attn, jnp.finfo(jnp.float32).min)
@@ -321,20 +347,10 @@ class ConvSwiGLU(nn.Module):
     """
     Causal SwiGLU FFN with strictly causal depthwise 1D conv on the gate path.
 
-    FIX 1 [CRITICAL]: padding="SAME" was replaced with explicit left-only padding.
-    padding="SAME" applies symmetric padding → output[t] sees input[t+1] (future
-    token leakage). This silently corrupts ALL gradient updates during pretraining.
-
-    Fix: pass padding=((kernel_size-1, 0),) to nn.Conv (left-pad only, no right-pad).
-    This is equivalent to WaveNet/Conformer causal conv:
-      output[t] = conv(input[t-(k-1)], ..., input[t])  ← strictly causal ✓
-
-    Verified: with kernel_size=3, pad_left=2:
-      input  = [a, b, c, d, e]
-      padded = [0, 0, a, b, c, d, e]   (left-pad 2)
-      out[0] = conv(0, 0, a)           ← no future
-      out[1] = conv(0, a, b)           ← no future
-      out[t] = conv(a[t-2], a[t-1], a[t]) ← strictly causal ✓
+    Fix 1: padding=((kernel_size-1, 0),) — left-pad only, no right-pad.
+    Flax nn.Conv accepts explicit (low, high) padding tuples per spatial dim.
+    With kernel_size=3, pad_left=2:
+      output[t] = conv(input[t-2], input[t-1], input[t])  ← strictly causal ✓
     """
     d_model:      int
     hidden_dim:   int
@@ -344,21 +360,17 @@ class ConvSwiGLU(nn.Module):
     @nn.compact
     def __call__(self, x, deterministic: bool):
         x_up = nn.Dense(self.hidden_dim * 2, use_bias=False, dtype=jnp.bfloat16)(x)
-        gate, val = jnp.split(x_up, 2, axis=-1)  # both [B, T, hidden_dim]
+        gate, val = jnp.split(x_up, 2, axis=-1)
 
-        # FIX 1: Causal depthwise conv via explicit left-only padding tuple.
-        # padding=((pad_left, pad_right),) for the single spatial (T) dimension.
-        # No jnp.pad needed — nn.Conv handles this natively with tuple padding.
         gate = nn.Conv(
             features=self.hidden_dim,
             kernel_size=(self.kernel_size,),
             strides=(1,),
             padding=((self.kernel_size - 1, 0),),  # left-pad only → causal ✓
-            feature_group_count=self.hidden_dim,   # depthwise (1 kernel per channel)
+            feature_group_count=self.hidden_dim,   # depthwise
             use_bias=False,
             dtype=jnp.bfloat16,
         )(gate)
-        # gate is now [B, T, hidden_dim] and strictly causal
 
         x = val * nn.silu(gate)
 
@@ -399,13 +411,8 @@ class TitanBlock(nn.Module):
 class ZenyxV2(nn.Module):
     """
     Nano-Titan: 8 unique blocks × 4 recurrences = 32 effective layers.
-    Weight sharing across recurrences: params stay at ~280M,
-    compute depth is 32 layers deep. Reasoning emerges from recurrence.
-
-    Weight sharing verified: each TitanBlock(name="block_i") is a single
-    Flax module instance called N_RECURRENCES times. Flax's nn.compact
-    resolves parameter scope by name — subsequent calls reuse the same
-    variables, not allocate new ones. Param count = 8 unique blocks only.
+    Weight sharing: each TitanBlock(name="block_i") is called N_RECURRENCES times.
+    Flax resolves param scope by name → subsequent calls reuse the same weights.
     """
     vocab_size:      int
     d_model:         int
@@ -426,7 +433,6 @@ class ZenyxV2(nn.Module):
         B, T  = input_ids.shape
         det   = not train
 
-        # Token embedding (bf16)
         embed_table = self.param(
             "embed_table",
             nn.initializers.normal(stddev=0.02),
@@ -434,10 +440,8 @@ class ZenyxV2(nn.Module):
         )
         x = embed_table[input_ids].astype(jnp.bfloat16)
 
-        # YaRN RoPE cache (static, built once per compilation)
         sin, cos = build_yarn_rope_cache(T, self.head_dim)
 
-        # 8 unique named blocks — each is ONE parameter set
         blocks = [
             TitanBlock(
                 d_model=self.d_model, n_heads=self.n_heads,
@@ -449,20 +453,17 @@ class ZenyxV2(nn.Module):
             for i in range(self.n_unique_blocks)
         ]
 
-        # Recursive passes — full gradient flow, no stop_gradient.
-        # Each recurrence calls the SAME 8 module instances → weight sharing.
         for _ in range(self.n_recurrences):
             for block in blocks:
                 x = block(x, sin, cos, deterministic=det)
 
         x = RMSNorm(self.d_model, name="final_norm")(x)
 
-        # Multi-Token Prediction heads
-        # t+1: weight-tied with embedding table (no extra params)
+        # t+1: weight-tied with embedding table
         logits_1 = x @ embed_table.T.astype(jnp.bfloat16)
         logits_list = [logits_1]
 
-        # t+2, t+3: independent small projection heads
+        # t+2, t+3: independent projection heads
         for i in range(1, self.mtp_heads):
             head_out = nn.Dense(
                 self.vocab_size, use_bias=False,
@@ -493,8 +494,11 @@ model = ZenyxV2(
     dropout_rate    = DROPOUT_RATE,
 )
 
-init_rng  = jrand.PRNGKey(GLOBAL_SEED)
-dummy     = jnp.ones((1, 64), dtype=jnp.int32)
+init_rng = jrand.PRNGKey(GLOBAL_SEED)
+# FIX 6: Init with MAX_SEQ_LEN so the compiled shape matches training.
+# Using (1, 64) before caused an expensive XLA recompile on the first training
+# step at T=16384. One init call at the full sequence length avoids this.
+dummy    = jnp.ones((1, MAX_SEQ_LEN), dtype=jnp.int32)
 variables = model.init(init_rng, input_ids=dummy, train=False)
 params    = variables["params"]
 
@@ -554,13 +558,8 @@ def create_train_state(params):
 def compute_mtp_loss(params, batch, dropout_rng):
     """
     Weighted Multi-Token Prediction loss.
-    t+1: weight 1.0 (main head, weight-tied)
-    t+2: weight 0.3
-    t+3: weight 0.1
-
-    Alignment verified by all 3 agreeing auditors (Claude, GPT, Gemini):
-      For offset k: pred = logits[:, :T-k, :] vs labels = batch[:, k:T]
-      pred[b,t,:] trains against batch[b, t+k] for all valid t. ✓ No off-by-one.
+    t+1: weight 1.0 | t+2: weight 0.3 | t+3: weight 0.1
+    For offset k: pred[:, :T-k, :] vs labels[:, k:T]  — no off-by-one. ✓
     """
     logits_list = model.apply(
         {"params": params},
@@ -592,12 +591,12 @@ def train_step_accum(state, micro_batches, dropout_rngs):
     Gradient accumulation via lax.scan inside pmap.
     Per-device shapes (after pmap sharding on axis 0):
       micro_batches: [GRAD_ACCUM, PER_CORE_BATCH, SEQ_LEN]
-      dropout_rngs:  [GRAD_ACCUM, 2]  (PRNGKey uint32 pairs)
+      dropout_rngs:  [GRAD_ACCUM]  typed PRNGKey array — passed directly,
+                     no key_data/wrap_key_data round-trip needed (Fix 4).
     """
     def accum_fn(carry, inputs):
         grads_acc, loss_acc = carry
-        mb, rng_data = inputs                     # rng_data: [2] uint32
-        rng = jrand.wrap_key_data(rng_data)       # FIX 4: reconstruct PRNGKey from raw data
+        mb, rng = inputs   # rng is a single PRNGKey (scalar key)
         loss, grads = jax.value_and_grad(compute_mtp_loss)(state.params, mb, rng)
         grads_acc = jax.tree_util.tree_map(lambda a, b: a + b, grads_acc, grads)
         return (grads_acc, loss_acc + loss), None
@@ -740,13 +739,19 @@ def stream_english(target_bytes: int, seed: int, skip_tokens: int = 0):
 
 def combined_stream(resume_step: int, seed: int):
     """
-    Weighted interleaved stream with deterministic token-level skipping.
-    On session restart: skips exactly resume_step × GLOBAL_BATCH × SEQ_LEN tokens.
-    Mix: 40% math | 40% code | 20% english  (weighted cycle 2:2:1)
+    Weighted interleaved stream. Mix: 40% math | 40% code | 20% english.
+
+    FIX 5: Each cycle slot gets its OWN independent generator instance with
+    a distinct seed. The previous code did:
+        cycle = [gen_math, gen_math, ...]  ← same object in two slots!
+    When slot 0 raised StopIteration, slot 1 (same object) immediately raised
+    it too, effectively halving math data and producing a 33/33/33 mix instead
+    of the intended 40/40/20. Fix: split the byte budget per slot and use
+    seed+1 for the second instance so the two math streams don't duplicate.
     """
     total_bytes  = TOTAL_TOKENS * 2
-    math_bytes   = int(total_bytes * MATH_RATIO)
-    code_bytes   = int(total_bytes * CODE_RATIO)
+    math_bytes   = int(total_bytes * MATH_RATIO)   # split equally across 2 slots
+    code_bytes   = int(total_bytes * CODE_RATIO)   # split equally across 2 slots
     eng_bytes    = int(total_bytes * ENG_RATIO)
 
     tokens_done  = resume_step * GLOBAL_BATCH * MAX_SEQ_LEN
@@ -754,15 +759,18 @@ def combined_stream(resume_step: int, seed: int):
     code_skip    = int(tokens_done * CODE_RATIO)
     eng_skip     = int(tokens_done * ENG_RATIO)
 
-    gen_math  = stream_math(math_bytes, seed, math_skip)
-    gen_code  = stream_code(code_bytes, seed, code_skip)
-    gen_eng   = stream_english(eng_bytes, seed, eng_skip)
-
-    # Weighted cycle: math, math, code, code, eng → 2:2:1 ratio
-    cycle  = [gen_math, gen_math, gen_code, gen_code, gen_eng]
-    done   = [False] * 5
-    idx    = 0
-    total  = 0
+    # Each slot gets half the total budget for that modality so combined
+    # the two math slots together still consume math_bytes total.
+    cycle = [
+        stream_math(math_bytes // 2, seed,     math_skip // 2),  # math slot A
+        stream_math(math_bytes // 2, seed + 1, math_skip // 2),  # math slot B (distinct seed)
+        stream_code(code_bytes // 2, seed,     code_skip // 2),  # code slot A
+        stream_code(code_bytes // 2, seed + 1, code_skip // 2),  # code slot B (distinct seed)
+        stream_english(eng_bytes,    seed,     eng_skip),        # eng  slot
+    ]
+    done  = [False] * 5
+    idx   = 0
+    total = 0
 
     while not all(done):
         i   = idx % len(cycle)
@@ -862,7 +870,6 @@ def save_checkpoint(state, step: int, meta: dict, val_batches=None):
     with open(meta_path, "w") as f:
         json.dump(meta, f, indent=2)
 
-    # Inference-only weights — clean bf16, no optimizer state
     params_only = serialization.to_bytes(final_state.params)
     params_path = TMP_DIR / f"params_step{step}.msgpack"
     with open(params_path, "wb") as f:
@@ -966,7 +973,6 @@ t_start     = time.time()
 
 try:
     while global_step < MAX_STEPS:
-        # Collect GRAD_ACCUM * MICRO_BATCH blocks for this step
         step_blocks = []
         for _ in range(GRAD_ACCUM * MICRO_BATCH):
             block = prefetch_q.get()
@@ -978,23 +984,22 @@ try:
         if len(step_blocks) < GRAD_ACCUM * MICRO_BATCH:
             break
 
-        # Reshape to [TPU_CORES, GRAD_ACCUM, PER_CORE_BATCH, SEQ_LEN]
-        # Using TPU_CORES_STATIC (=8) as a Python literal → no XLA recompile risk.
+        # Reshape: [256, SEQ_LEN] → [TPU_CORES, GRAD_ACCUM, PER_CORE_BATCH, SEQ_LEN]
+        # TPU_CORES_STATIC is a Python int literal → compile-time constant for XLA.
         arr = np.array(step_blocks, dtype=np.int32)
         arr = arr.reshape(GRAD_ACCUM, TPU_CORES_STATIC, PER_CORE_BATCH, MAX_SEQ_LEN)
-        arr = arr.transpose(1, 0, 2, 3)   # [8, GRAD_ACCUM, PER_CORE_BATCH, SEQ_LEN]
-        arr = jnp.asarray(arr, dtype=jnp.int32)  # host → device once
+        arr = arr.transpose(1, 0, 2, 3)
+        arr = jnp.asarray(arr, dtype=jnp.int32)
 
-        # FIX 4: Pure JAX RNG sharding — no key_data() extraction.
-        # jrand.split produces proper PRNGKey arrays; we extract uint32 data
-        # only at the boundary (jrand.key_data) but wrap_key_data inside pmap.
+        # FIX 4 (v2.2 simplification): produce dropout keys via pure jrand.split.
+        # jrand.split(key, n) returns a typed key array of shape [n].
+        # pmap shards axis-0 → each device receives [GRAD_ACCUM] keys.
+        # lax.scan iterates over them → each micro-step gets one unique key.
+        # No key_data/wrap_key_data needed at all.
         rng, step_rng = jrand.split(rng)
-        per_core_rngs = jrand.split(step_rng, TPU_CORES_STATIC)  # [8, 2]
-        dropout_rngs  = jnp.stack([
-            jnp.stack([jrand.key_data(jrand.fold_in(per_core_rngs[c], i))
-                       for i in range(GRAD_ACCUM)])
-            for c in range(TPU_CORES_STATIC)
-        ])  # [TPU_CORES, GRAD_ACCUM, 2]  — uint32 pairs, wrapped inside pmap
+        # [TPU_CORES, GRAD_ACCUM] typed key array
+        all_keys     = jrand.split(step_rng, TPU_CORES_STATIC * GRAD_ACCUM)
+        dropout_rngs = all_keys.reshape(TPU_CORES_STATIC, GRAD_ACCUM)
 
         state, loss, grad_norm = train_step_accum(state, arr, dropout_rngs)
 
@@ -1019,7 +1024,6 @@ try:
 
         global_step += 1
 
-        # Eval + checkpoint every SAVE_EVERY steps
         if global_step % SAVE_EVERY == 0:
             log.info(f"[EVAL] Running validation at step {global_step}...")
             val_losses = []
