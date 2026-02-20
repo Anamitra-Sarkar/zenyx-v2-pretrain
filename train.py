@@ -78,12 +78,25 @@
 #           JAX tracer). Apply jax.checkpoint to _fwd instead of model.apply
 #           directly. The rematerialisation boundary is identical; Flax never
 #           receives a traced bool. ✓
+#
+# ── FIXES (v2.7) ──────────────────────────────────────────────────────────────
+# Fix 17 [CRITICAL] Checkpoint files lost on session end.
+#         Root cause: Files were saved to /tmp/zenyx_v2/ and deleted after
+#         upload. If upload failed silently or session was killed, files were
+#         gone. /kaggle/working/ output was never written.
+#         Fix:
+#         (a) Always copy checkpoint files to /kaggle/working/checkpoints/
+#             BEFORE attempting HF upload. These survive as Kaggle output. ✓
+#         (b) Use explicit keyword args for api.upload_file() calls. ✓
+#         (c) Add per-file try/except so partial upload failures are logged
+#             without aborting the entire save. ✓
+#         (d) Local /tmp files are only deleted AFTER successful upload. ✓
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ════════════════════════════════════════════════════════════════════════════════
 # §0  IMPORTS
 # ════════════════════════════════════════════════════════════════════════════════
-import os, re, gc, sys, json, math, time, logging
+import os, re, gc, sys, json, math, time, logging, shutil
 import numpy as np
 from pathlib import Path
 from functools import partial
@@ -156,6 +169,10 @@ TOKENIZER_ID  = "Arko007/zenyx-v2-tokenizer"
 GLOBAL_SEED   = 42
 TMP_DIR       = Path("/tmp/zenyx_v2")
 TMP_DIR.mkdir(parents=True, exist_ok=True)
+
+# FIX 17: Kaggle output backup directory — survives session end as notebook output
+KAGGLE_OUT_DIR = Path("/kaggle/working/checkpoints")
+KAGGLE_OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Model Dimensions ──────────────────────────────────────────────────────────
 VOCAB_SIZE      = 32_768
@@ -963,31 +980,78 @@ def save_checkpoint(state, step: int, meta: dict, val_batches=None):
     with open(params_path, "wb") as f:
         f.write(params_only)
 
+    # FIX 17(a): Copy to /kaggle/working/checkpoints/ FIRST as a guaranteed
+    # backup. These files persist in Kaggle's output section even if HF upload
+    # fails or the session is killed right after. Only the latest checkpoint is
+    # kept to avoid filling up disk (previous one is removed).
+    kaggle_ckpt  = KAGGLE_OUT_DIR / ckpt_path.name
+    kaggle_meta  = KAGGLE_OUT_DIR / "metadata.json"
+    kaggle_param = KAGGLE_OUT_DIR / params_path.name
+
+    shutil.copy2(ckpt_path,   kaggle_ckpt)
+    shutil.copy2(meta_path,   kaggle_meta)
+    shutil.copy2(params_path, kaggle_param)
+    log.info(f"✓ Backup saved to Kaggle output: {kaggle_ckpt}")
+
+    # Remove previous step's backup to save disk space (keep only latest)
+    for old in KAGGLE_OUT_DIR.glob("state_step*.msgpack"):
+        if old != kaggle_ckpt:
+            old.unlink(missing_ok=True)
+    for old in KAGGLE_OUT_DIR.glob("params_step*.msgpack"):
+        if old != kaggle_param:
+            old.unlink(missing_ok=True)
+
+    if val_batches is not None:
+        vpath = TMP_DIR / "val_set.npy"
+        np.save(vpath, val_batches)
+        shutil.copy2(vpath, KAGGLE_OUT_DIR / "val_set.npy")
+
+    # FIX 17(b)(c)(d): Explicit kwargs, per-file try/except, delete only on success
     ensure_repo()
-    try:
-        api.upload_file(str(ckpt_path),
-                        path_in_repo=f"checkpoints/{ckpt_path.name}",
-                        repo_id=REPO_ID, repo_type="model")
-        api.upload_file(str(meta_path),
-                        path_in_repo="metadata.json",
-                        repo_id=REPO_ID, repo_type="model")
-        api.upload_file(str(params_path),
-                        path_in_repo=f"params/{params_path.name}",
-                        repo_id=REPO_ID, repo_type="model")
+    upload_ok = True
 
-        if val_batches is not None:
-            vpath = TMP_DIR / "val_set.npy"
-            np.save(vpath, val_batches)
-            api.upload_file(str(vpath), path_in_repo="val_set.npy",
-                            repo_id=REPO_ID, repo_type="model")
+    for local_path, repo_path in [
+        (ckpt_path,   f"checkpoints/{ckpt_path.name}"),
+        (meta_path,   "metadata.json"),
+        (params_path, f"params/{params_path.name}"),
+    ]:
+        try:
+            api.upload_file(
+                path_or_fileobj=str(local_path),
+                path_in_repo=repo_path,
+                repo_id=REPO_ID,
+                repo_type="model",
+            )
+        except Exception as e:
+            log.error(f"[UPLOAD] Failed to upload {repo_path}: {e}")
+            upload_ok = False
 
-        log.info(f"✓ Checkpoint saved: step={step} | "
-                 f"ckpt={len(state_bytes)/1e6:.1f}MB | "
-                 f"params_only={len(params_only)/1e6:.1f}MB")
+    if val_batches is not None:
+        try:
+            api.upload_file(
+                path_or_fileobj=str(TMP_DIR / "val_set.npy"),
+                path_in_repo="val_set.npy",
+                repo_id=REPO_ID,
+                repo_type="model",
+            )
+        except Exception as e:
+            log.error(f"[UPLOAD] Failed to upload val_set.npy: {e}")
+            upload_ok = False
+
+    if upload_ok:
+        log.info(
+            f"✓ Checkpoint uploaded to HF Hub: step={step} | "
+            f"ckpt={len(state_bytes)/1e6:.1f}MB | "
+            f"params_only={len(params_only)/1e6:.1f}MB"
+        )
+        # Only delete /tmp files after confirmed successful upload
         for p in [ckpt_path, meta_path, params_path]:
             p.unlink(missing_ok=True)
-    except Exception as e:
-        log.error(f"Upload failed (files saved locally): {e}")
+    else:
+        log.warning(
+            f"[UPLOAD] Partial or full upload failure at step {step}. "
+            f"Files retained in /tmp and backed up to {KAGGLE_OUT_DIR}."
+        )
 
 
 # ════════════════════════════════════════════════════════════════════════════════
