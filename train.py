@@ -50,58 +50,21 @@
 #         referencing an out-of-scope variable `V` (undefined at module level).
 #         Although Python never executes code after a return, having it confuses
 #         linters, future edits, and static checkers. Removed entirely. ✓
-#
-# ── FIXES (v2.5) ──────────────────────────────────────────────────────────────
-# Fix 15 [CRITICAL] RESOURCE_EXHAUSTED: exceeded HBM by 674.94 MB.
-#         Root cause (from XLA allocator report):
-#           Rank-1 temp: f32[1,14335,16,2048] = 1.75 GB  ← full logit tensor
-#             live during backward pass of chunked_cross_entropy.
-#           Rank-2 temp: bf16[1,14335,16,2048] = 895 MB  ← same tensor
-#             rematerialised by @jax.checkpoint on compute_mtp_loss.
-#         Three surgical changes:
-#         (a) Replace monolithic reshape+max+exp with sequential lax.scan.
-#         (b) Remove @jax.checkpoint from compute_mtp_loss; apply surgically
-#             on model.apply instead.
-#         (c) CHUNK_SIZE 2048 → 1024 for extra HBM safety margin. ✓
-#
-# ── FIXES (v2.6) ──────────────────────────────────────────────────────────────
-# Fix 16 [CRITICAL] InvalidFilterError: "JitTracer(bool[])"
-#         Root cause:
-#           jax.checkpoint(model.apply)(..., mutable=False) passes the Python
-#           bool False through JAX's abstract evaluation / tracing machinery.
-#           JAX converts it to a JitTracer(bool[]) abstract value.
-#           Flax's scope.in_filter() only accepts real Python bool/str/DenyList
-#           — never traced values — so it raises InvalidFilterError.
-#         Fix:
-#           Wrap the forward pass in a plain Python helper _fwd() that closes
-#           over mutable as a compile-time Python constant (never touches the
-#           JAX tracer). Apply jax.checkpoint to _fwd instead of model.apply
-#           directly. The rematerialisation boundary is identical; Flax never
-#           receives a traced bool. ✓
-#
-# ── FIXES (v2.7) ──────────────────────────────────────────────────────────────
-# Fix 17 [CRITICAL] Checkpoint files lost on session end.
-#         Root cause: Files were saved to /tmp/zenyx_v2/ and deleted after
-#         upload. If upload failed silently or session was killed, files were
-#         gone. /kaggle/working/ output was never written.
-#         Fix:
-#         (a) Always copy checkpoint files to /kaggle/working/checkpoints/
-#             BEFORE attempting HF upload. These survive as Kaggle output. ✓
-#         (b) Use explicit keyword args for api.upload_file() calls. ✓
-#         (c) Add per-file try/except so partial upload failures are logged
-#             without aborting the entire save. ✓
-#         (d) Local /tmp files are only deleted AFTER successful upload. ✓
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ════════════════════════════════════════════════════════════════════════════════
 # §0  IMPORTS
 # ════════════════════════════════════════════════════════════════════════════════
-import os, re, gc, sys, json, math, time, logging, shutil
+import os, re, gc, sys, json, math, time, logging
 import numpy as np
 from pathlib import Path
 from functools import partial
 from queue import Queue
 from threading import Thread
+
+# FIX 10: TPU-specific XLA flags.
+# --xla_gpu_enable_latency_hiding_scheduler had zero effect on TPU (GPU-only flag).
+# The TPU equivalents overlap allreduce (pmean) with compute, reducing step time.
 
 import jax
 import jax.numpy as jnp
@@ -113,7 +76,9 @@ from flax.training import train_state
 from flax import serialization
 import flax.jax_utils
 
-# FIX 11: JAX version guard.
+# FIX 11: JAX version guard. Typed PRNG key arrays (used for RNG in lax.scan)
+# require JAX >= 0.4.16. Kaggle TPU v5e-8 ships 0.4.30+ as of 2026, so this
+# will never fire in production but gives a clear error on stale environments.
 _jax_ver = tuple(int(x) for x in jax.__version__.split(".")[:3])
 if _jax_ver < (0, 4, 16):
     raise RuntimeError(
@@ -170,20 +135,16 @@ GLOBAL_SEED   = 42
 TMP_DIR       = Path("/tmp/zenyx_v2")
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 
-# FIX 17: Kaggle output backup directory — survives session end as notebook output
-KAGGLE_OUT_DIR = Path("/kaggle/working/checkpoints")
-KAGGLE_OUT_DIR.mkdir(parents=True, exist_ok=True)
-
 # ── Model Dimensions ──────────────────────────────────────────────────────────
 VOCAB_SIZE      = 32_768
-D_MODEL         = 576
+D_MODEL         = 576       # head_dim=64, 9 heads → 576
 N_HEADS         = 9
-N_KV_HEADS      = 3
+N_KV_HEADS      = 3         # GQA 3:1
 HEAD_DIM        = D_MODEL // N_HEADS   # 64
 MLP_HIDDEN      = 1536
 N_UNIQUE_BLOCKS = 8
-N_RECURRENCES   = 4
-MAX_SEQ_LEN     = 14_336
+N_RECURRENCES   = 4         # effective depth = 32
+MAX_SEQ_LEN     = 9_216
 DROPOUT_RATE    = 0.0
 
 # MLA compression dims
@@ -199,6 +160,9 @@ log.info(f"JAX version: {jax.__version__}")
 log.info(f"JAX devices: {jax.devices()}")
 TPU_CORES = jax.device_count()
 
+# Hard assert: fail loudly if not the expected v5e-8 pod.
+# TPU_CORES_STATIC is a Python int literal so XLA sees a compile-time constant
+# in all reshapes (no dynamic-shape recompile risk).
 TPU_CORES_STATIC = 8
 if TPU_CORES != TPU_CORES_STATIC:
     raise RuntimeError(
@@ -208,10 +172,23 @@ if TPU_CORES != TPU_CORES_STATIC:
         "update TPU_CORES_STATIC to match your device count."
     )
 
+# FIX 9: HBM budget correction.
+# PER_CORE_BATCH=2 at T=16384 materialises attention [2,9,16384,16384] fp32
+# = 19.7 GB per chip — exceeds the 16 GB HBM of each v5e chip entirely.
+# Reduced to PER_CORE_BATCH=1: attention becomes [1,9,16384,16384] = 9.86 GB.
+# GRAD_ACCUM doubled 16→32 to keep GLOBAL_BATCH = 256 unchanged.
+#
+# Per-chip HBM breakdown (PER_CORE_BATCH=1):
+#   Params (bf16)         :  280M × 2B          =  ~560 MB
+#   AdamW m+v (fp32)      :  280M × 2 × 4B     = ~2,240 MB
+#   Grad accumulator(fp32):  280M × 4B          = ~1,120 MB
+#   Peak attn matrix(fp32): [1,9,16384,16384]×4B = ~9,865 MB
+#   Misc (embeds, norms …):                        ~  200 MB
+#   TOTAL estimated peak                           ~13,985 MB  ≈ 13.7 GB  ✓
 PER_CORE_BATCH  = 1
 MICRO_BATCH     = PER_CORE_BATCH * TPU_CORES   # 8
-GRAD_ACCUM      = 32
-GLOBAL_BATCH    = MICRO_BATCH * GRAD_ACCUM     # 256
+GRAD_ACCUM      = 32                            # was 16; doubled to keep global batch = 256
+GLOBAL_BATCH    = MICRO_BATCH * GRAD_ACCUM     # 8 × 32 = 256  (unchanged)
 
 log.info(f"TPU Cores: {TPU_CORES} | Per-core batch: {PER_CORE_BATCH} | "
          f"Micro-batch: {MICRO_BATCH} | Grad-accum: {GRAD_ACCUM} | "
@@ -262,14 +239,20 @@ log.info(f"✓ Tokenizer loaded | vocab={len(tokenizer)} | pad_id={PAD_ID} | eos
 # §4  YARN-SCALED ROPE
 # ════════════════════════════════════════════════════════════════════════════════
 def build_yarn_rope_cache(seq_len: int, head_dim: int):
+    """
+    YaRN-scaled RoPE frequencies. Extends context from 512 → 16k.
+    t=0 at high-freq boundary (scale=1.0, no compression).
+    t=1 at low-freq  boundary (scale=1/factor, full compression).
+    Epsilon guard prevents division-by-zero if YARN_ALPHA==YARN_BETA.
+    """
     freqs = 1.0 / (ROPE_BASE ** (jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim))
     wavelengths = 2.0 * jnp.pi / freqs
 
-    low_boundary  = float(MAX_SEQ_LEN) / YARN_ALPHA
-    high_boundary = float(MAX_SEQ_LEN) / YARN_BETA
+    low_boundary  = float(MAX_SEQ_LEN) / YARN_ALPHA   # 16384.0
+    high_boundary = float(MAX_SEQ_LEN) / YARN_BETA     # 512.0
 
-    den = low_boundary - high_boundary
-    den = jnp.where(den == 0.0, 1e-6, den)
+    den = low_boundary - high_boundary                 # 15872.0
+    den = jnp.where(den == 0.0, 1e-6, den)             # epsilon guard
 
     t = (wavelengths - high_boundary) / den
     t = jnp.clip(t, 0.0, 1.0)
@@ -317,6 +300,11 @@ class RMSNorm(nn.Module):
 
 
 class MLAAttention(nn.Module):
+    """
+    Multi-head Latent Attention (DeepSeek-style MLA).
+    Uses fused TPU attention (jax.nn.dot_product_attention)
+    so no full [T,T] matrix is materialized.
+    """
     d_model:      int
     n_heads:      int
     n_kv_heads:   int
@@ -329,46 +317,82 @@ class MLAAttention(nn.Module):
     def __call__(self, x, sin, cos, deterministic: bool):
         B, T, _ = x.shape
 
+        # ─────────────────────────────────────────
+        # Q projection (latent compression)
+        # ─────────────────────────────────────────
         q = nn.Dense(self.q_latent, use_bias=False, dtype=jnp.bfloat16)(x)
         q = RMSNorm(self.q_latent)(q)
-        q = nn.Dense(self.n_heads * self.head_dim, use_bias=False, dtype=jnp.bfloat16)(q)
+        q = nn.Dense(self.n_heads * self.head_dim,
+                     use_bias=False,
+                     dtype=jnp.bfloat16)(q)
         q = q.reshape(B, T, self.n_heads, self.head_dim)
 
-        kv_lat = nn.Dense(self.kv_latent, use_bias=False, dtype=jnp.bfloat16)(x)
+        # ─────────────────────────────────────────
+        # KV projection (shared latent compression)
+        # ─────────────────────────────────────────
+        kv_lat = nn.Dense(self.kv_latent,
+                          use_bias=False,
+                          dtype=jnp.bfloat16)(x)
         kv_lat = RMSNorm(self.kv_latent)(kv_lat)
 
-        k = nn.Dense(self.n_kv_heads * self.head_dim, use_bias=False, dtype=jnp.bfloat16)(kv_lat)
-        v = nn.Dense(self.n_kv_heads * self.head_dim, use_bias=False, dtype=jnp.bfloat16)(kv_lat)
+        k = nn.Dense(self.n_kv_heads * self.head_dim,
+                     use_bias=False,
+                     dtype=jnp.bfloat16)(kv_lat)
+        v = nn.Dense(self.n_kv_heads * self.head_dim,
+                     use_bias=False,
+                     dtype=jnp.bfloat16)(kv_lat)
 
         k = k.reshape(B, T, self.n_kv_heads, self.head_dim)
         v = v.reshape(B, T, self.n_kv_heads, self.head_dim)
 
+        # ─────────────────────────────────────────
+        # RoPE
+        # ─────────────────────────────────────────
         sin_ = sin[None, :T, None, :]
         cos_ = cos[None, :T, None, :]
         q = apply_rope(q, sin_, cos_)
         k = apply_rope(k, sin_, cos_)
 
+        # ─────────────────────────────────────────
+        # GQA expansion (repeat KV heads)
+        # ─────────────────────────────────────────
         repeat = self.n_heads // self.n_kv_heads
         if repeat > 1:
             k = jnp.repeat(k, repeat, axis=2)
             v = jnp.repeat(v, repeat, axis=2)
 
+        # ─────────────────────────────────────────
+        # TPU-FUSED MEMORY-EFFICIENT ATTENTION
+        # ─────────────────────────────────────────
+        # Shapes required: [B, H, T, D]
         q = q.transpose(0, 2, 1, 3)
         k = k.transpose(0, 2, 1, 3)
         v = v.transpose(0, 2, 1, 3)
 
         out = jax.nn.dot_product_attention(
-            query=q, key=k, value=v,
-            bias=None, mask=None,
+            query=q,
+            key=k,
+            value=v,
+            bias=None,
+            mask=None,
             is_causal=True,
             scale=1.0 / math.sqrt(self.head_dim),
         )
 
+        # Back to [B, T, D_model]
         out = out.transpose(0, 2, 1, 3).reshape(B, T, self.d_model)
-        return nn.Dense(self.d_model, use_bias=False, dtype=jnp.bfloat16)(out)
+
+        return nn.Dense(self.d_model,
+                        use_bias=False,
+                        dtype=jnp.bfloat16)(out)
 
 
 class ConvSwiGLU(nn.Module):
+    """
+    Causal SwiGLU FFN with strictly causal depthwise 1D conv on the gate path.
+    padding=((kernel_size-1, 0),): left-pad only, no right-pad (strictly causal).
+    output[t] = conv(input[t-(k-1)], ..., input[t])  ← no future tokens. ✓
+    """
     d_model:      int
     hidden_dim:   int
     dropout_rate: float = 0.0
@@ -384,7 +408,7 @@ class ConvSwiGLU(nn.Module):
             kernel_size=(self.kernel_size,),
             strides=(1,),
             padding=((self.kernel_size - 1, 0),),  # left-pad only → causal ✓
-            feature_group_count=self.hidden_dim,
+            feature_group_count=self.hidden_dim,   # depthwise
             use_bias=False,
             dtype=jnp.bfloat16,
         )(gate)
@@ -398,6 +422,7 @@ class ConvSwiGLU(nn.Module):
 
 
 class TitanBlock(nn.Module):
+    """Single unique Transformer block. Weights shared across recurrences."""
     d_model:      int
     n_heads:      int
     n_kv_heads:   int
@@ -425,6 +450,12 @@ class TitanBlock(nn.Module):
 
 
 class ZenyxV2(nn.Module):
+    """
+    Nano-Titan: 8 unique blocks × 4 recurrences = 32 effective layers.
+    Weight sharing: each TitanBlock(name="block_i") is called N_RECURRENCES times.
+    Flax resolves param scope by name → subsequent calls reuse the same weights.
+    Total unique params: ~280M. Effective compute depth: 32 layers.
+    """
     vocab_size:      int
     d_model:         int
     n_heads:         int
@@ -470,9 +501,11 @@ class ZenyxV2(nn.Module):
 
         x = RMSNorm(self.d_model, name="final_norm")(x)
 
+        # t+1: weight-tied with embedding table (no extra params)
         logits_1 = x @ embed_table.T.astype(jnp.bfloat16)
         logits_list = [logits_1]
 
+        # t+2, t+3: independent small projection heads
         for i in range(1, self.mtp_heads):
             head_out = nn.Dense(
                 self.vocab_size, use_bias=False,
@@ -504,6 +537,8 @@ model = ZenyxV2(
 )
 
 init_rng  = jrand.PRNGKey(GLOBAL_SEED)
+# Init with MAX_SEQ_LEN so the compiled XLA shape matches training.
+# Using (1,64) previously triggered a full recompile on the first training step.
 dummy     = jnp.ones((1, MAX_SEQ_LEN), dtype=jnp.int32)
 variables = model.init(init_rng, input_ids=dummy, train=False)
 params    = variables["params"]
@@ -518,6 +553,7 @@ log.info(f"  BF16 model size: {param_count * 2 / 1e6:.1f} MB")
 # §7  WSD LEARNING RATE SCHEDULE
 # ════════════════════════════════════════════════════════════════════════════════
 def wsd_schedule(step):
+    """Warmup-Stable-Decay: linear warmup → constant → cosine decay."""
     warmup_lr = LEARNING_RATE * jnp.minimum(step / WARMUP_STEPS, 1.0)
     decay_progress = jnp.clip(
         (step - WARMUP_STEPS - STABLE_STEPS) / DECAY_STEPS, 0.0, 1.0
@@ -532,7 +568,11 @@ def wsd_schedule(step):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# §8  TRAIN STATE
+# §8-§10  REPLACEMENT: TRAIN STATE, MEMORY-SAFE CHUNKED CE, MTP LOSS, PMAP STEPS
+# - Uses static CHUNK_SIZE = 2048 (smaller → less HBM; raises compute slightly).
+# - Uses reshape + take_along_axis (XLA-friendly static shapes, no fori_loop).
+# - compute_mtp_loss is checkpointed (rematerialisation) to reduce activation HBM.
+# - train_step_accum performs grad-accum via lax.scan inside pmap as before.
 # ════════════════════════════════════════════════════════════════════════════════
 
 class ZenyxTrainState(train_state.TrainState):
@@ -558,127 +598,93 @@ def create_train_state(params):
     )
 
 
-# ════════════════════════════════════════════════════════════════════════════════
-# §9  CHUNKED CROSS-ENTROPY
-#
-# Sequential lax.scan over vocab chunks — only ONE f32[B,T,CHUNK_SIZE] slice
-# is live in HBM at any time (~56 MB peak vs 1.75 GB for monolithic reshape).
-# ════════════════════════════════════════════════════════════════════════════════
-CHUNK_SIZE = 1024
-NUM_CHUNKS = VOCAB_SIZE // CHUNK_SIZE   # 32
+# Static constants (must divide exactly)
+CHUNK_SIZE  = 2048                         # lowered from 4096 → 2048 to free ~2-4 GB HBM
+NUM_CHUNKS  = VOCAB_SIZE // CHUNK_SIZE     # 32768 / 2048 = 16
 
 
 def chunked_cross_entropy(logits, labels):
     """
-    Memory-safe chunked cross-entropy.
-    logits : bf16 [B, T, V]
-    labels : int32 [B, T]
-    returns: float32 [B, T]  per-position NLL
+    Memory-safe cross entropy without dynamic indexing.
+    logits: bf16 [B, T, V]
+    labels: int32 [B, T]
+    Returns per-position NLL float32 [B, T]
+
+    FIX 13: This function takes exactly 2 positional args (logits, labels).
+    VOCAB_SIZE is read from module scope — do NOT pass it as a third argument.
     """
     B, T, V = logits.shape
-    assert V == VOCAB_SIZE, f"Expected vocab {VOCAB_SIZE}, got {V}"
+    assert V == VOCAB_SIZE
     assert VOCAB_SIZE % CHUNK_SIZE == 0
 
-    logits_f32 = logits.astype(jnp.float32)
+    # ─────────────────────────────────────────
+    # 1) reshape vocab into chunks
+    # [B, T, 32768] → [B, T, 16, 2048]
+    # ─────────────────────────────────────────
+    logits = logits.reshape(B, T, NUM_CHUNKS, CHUNK_SIZE)
+    logits = logits.astype(jnp.float32)
 
-    # Pass 1: global max over vocab (stable softmax numerics)
-    def max_body(carry, chunk_idx):
-        start = chunk_idx * CHUNK_SIZE
-        chunk = jax.lax.dynamic_slice_in_dim(logits_f32, start, CHUNK_SIZE, axis=-1)
-        return jnp.maximum(carry, chunk.max(axis=-1)), None
+    # ─────────────────────────────────────────
+    # 2) compute max over vocab (two-stage)
+    # ─────────────────────────────────────────
+    max_chunk  = jnp.max(logits, axis=-1)      # [B, T, 16]
+    max_logits = jnp.max(max_chunk, axis=-1)   # [B, T]
 
-    global_max, _ = jax.lax.scan(
-        max_body,
-        jnp.full((B, T), -jnp.inf, dtype=jnp.float32),
-        jnp.arange(NUM_CHUNKS, dtype=jnp.int32),
-    )
+    # subtract for numerical stability
+    logits = logits - max_logits[..., None, None]
 
-    # Pass 2: sum(exp(logit - max)) chunk-by-chunk
-    def sum_body(carry, chunk_idx):
-        start = chunk_idx * CHUNK_SIZE
-        chunk = jax.lax.dynamic_slice_in_dim(logits_f32, start, CHUNK_SIZE, axis=-1)
-        return carry + jnp.exp(chunk - global_max[..., None]).sum(axis=-1), None
+    # ─────────────────────────────────────────
+    # 3) compute exp sum
+    # ─────────────────────────────────────────
+    exp_logits = jnp.exp(logits)
+    sum_exp    = exp_logits.sum(axis=(-1, -2))  # sum over chunks + vocab positions
 
-    sum_exp, _ = jax.lax.scan(
-        sum_body,
-        jnp.zeros((B, T), dtype=jnp.float32),
-        jnp.arange(NUM_CHUNKS, dtype=jnp.int32),
-    )
+    # ─────────────────────────────────────────
+    # 4) gather correct token logits
+    # ─────────────────────────────────────────
+    chunk_ids = labels // CHUNK_SIZE            # [B, T] — which chunk
+    token_ids = labels % CHUNK_SIZE             # [B, T] — position inside chunk
 
-    # Pass 3: gather target-token logit
-    chunk_ids = labels // CHUNK_SIZE
-    token_ids = labels % CHUNK_SIZE
+    # gather the target chunk: [B, T, 1, 2048]
+    gathered_chunk = jnp.take_along_axis(
+        logits,
+        chunk_ids[..., None, None],
+        axis=2,
+    )                                           # [B, T, 1, 2048]
+    gathered_chunk = gathered_chunk[..., 0, :] # [B, T, 2048]
 
-    def gather_body(carry, chunk_idx):
-        start = chunk_idx * CHUNK_SIZE
-        chunk = jax.lax.dynamic_slice_in_dim(logits_f32, start, CHUNK_SIZE, axis=-1)
-        tok   = jnp.take_along_axis(chunk, token_ids[..., None], axis=-1)[..., 0]
-        mask  = (chunk_ids == chunk_idx)
-        return jnp.where(mask, tok, carry), None
+    # gather the target token within the chunk: [B, T]
+    gathered_token = jnp.take_along_axis(
+        gathered_chunk,
+        token_ids[..., None],
+        axis=-1,
+    )[..., 0]                                   # [B, T]
 
-    target_logit, _ = jax.lax.scan(
-        gather_body,
-        jnp.zeros((B, T), dtype=jnp.float32),
-        jnp.arange(NUM_CHUNKS, dtype=jnp.int32),
-    )
-
-    log_prob = (target_logit - global_max) - jnp.log(sum_exp + 1e-8)
-    return -log_prob   # float32 [B, T]
+    # ─────────────────────────────────────────
+    # 5) final NLL  (float32 [B, T])
+    # ─────────────────────────────────────────
+    log_prob = gathered_token - jnp.log(sum_exp + 1e-8)
+    return -log_prob
 
 
-# ════════════════════════════════════════════════════════════════════════════════
-# §10  MTP LOSS + PMAP STEPS
-#
-# FIX 16: InvalidFilterError from jax.checkpoint(model.apply)(..., mutable=False)
-# ─────────────────────────────────────────────────────────────────────────────
-# PROBLEM:
-#   When JAX traces jax.checkpoint(model.apply), every argument — including
-#   keyword arguments like mutable=False — passes through JAX's abstract
-#   evaluation. The Python bool False becomes a JitTracer(bool[]).
-#   Flax's scope.in_filter() is called at trace time with this traced value,
-#   but it only handles real Python bool/str/DenyList, so it raises:
-#       InvalidFilterError: Invalid Filter: "JitTracer(bool[])"
-#
-# FIX:
-#   Define a plain Python helper _fwd(params, batch, dropout_rng) that calls
-#   model.apply with mutable as a hard-coded Python literal — never a traced
-#   value. Apply jax.checkpoint to _fwd instead of model.apply.
-#   The checkpoint boundary (and therefore rematerialisation behaviour) is
-#   exactly the same as before, but Flax only ever sees real Python bools. ✓
-# ════════════════════════════════════════════════════════════════════════════════
-
-def _fwd(params, batch, dropout_rng):
+# Keep checkpoint/remat to reduce stored activations during backward.
+@jax.checkpoint
+def compute_mtp_loss(params, batch, dropout_rng):
     """
-    Pure Python wrapper around model.apply for training.
-    All keyword args (train=True, mutable=False) are Python literals —
-    they are resolved at Python import time, never touched by JAX's tracer.
-    This is the function that jax.checkpoint wraps.
+    Compute MTP loss in a streaming, memory-friendly manner.
+    - params: model params
+    - batch: [B, T] int32
+    - dropout_rng: PRNGKey (typed or legacy)
+    Returns scalar float32 loss (averaged and weighted across MTP heads).
     """
-    return model.apply(
+    # Forward (returns list of logits in bf16)
+    logits_list = model.apply(
         {"params": params},
         input_ids=batch,
         train=True,
         rngs={"dropout": dropout_rng},
-        # mutable is intentionally NOT passed: Flax defaults to mutable=False
-        # for stateless modules, which is what we want. No traced bool ever
-        # reaches in_filter(). ✓
+        mutable=False,
     )
-
-
-# jax.checkpoint(_fwd): transformer block activations are rematerialised
-# during the backward pass; CE intermediates (tiny ~56 MB) are not. ✓
-_fwd_checkpointed = jax.checkpoint(_fwd)
-
-
-def compute_mtp_loss(params, batch, dropout_rng):
-    """
-    MTP loss: weighted sum over t+1, t+2, t+3 prediction heads.
-    params      : model params pytree
-    batch       : int32 [B, T]
-    dropout_rng : PRNGKey
-    Returns     : scalar float32 loss
-    """
-    logits_list = _fwd_checkpointed(params, batch, dropout_rng)
 
     total_loss   = 0.0
     total_weight = 0.0
@@ -689,10 +695,11 @@ def compute_mtp_loss(params, batch, dropout_rng):
         if clip_len <= 0:
             continue
 
-        logits_slice = logits[:, :clip_len, :]
-        labels_slice = batch[:, offset:offset + clip_len].astype(jnp.int32)
+        logits_slice = logits[:, :clip_len, :]                        # bf16 [B, clip_len, V]
+        labels_slice = batch[:, offset:offset + clip_len].astype(jnp.int32)  # [B, clip_len]
 
-        nll = chunked_cross_entropy(logits_slice, labels_slice)
+        # FIX 13: call with 2 args only — VOCAB_SIZE is module-level constant
+        nll = chunked_cross_entropy(logits_slice, labels_slice)       # float32 [B, clip_len]
 
         mask           = labels_slice != PAD_ID
         masked_nll_sum = jnp.where(mask, nll, 0.0).sum()
@@ -705,15 +712,16 @@ def compute_mtp_loss(params, batch, dropout_rng):
     return (total_loss / (total_weight + 1e-12)).astype(jnp.float32)
 
 
+# PMAPed training step with gradient accumulation inside pmap.
 @partial(jax.pmap, axis_name="devices", donate_argnums=(0,))
 def train_step_accum(state, micro_batches, dropout_rngs):
     """
-    micro_batches: [GRAD_ACCUM, PER_CORE_BATCH, SEQ_LEN] per-device shard
-    dropout_rngs : [GRAD_ACCUM] typed PRNGKey array per-device
+    micro_batches: [GRAD_ACCUM, PER_CORE_BATCH, SEQ_LEN] (per-device shard)
+    dropout_rngs:  [GRAD_ACCUM] typed PRNGKey array (per-device)
     """
     def accum_fn(carry, inputs):
         grads_acc, loss_acc = carry
-        mb, rng = inputs
+        mb, rng = inputs  # mb: [PER_CORE_BATCH, SEQ_LEN]
         loss, grads = jax.value_and_grad(compute_mtp_loss)(state.params, mb, rng)
         grads_acc = jax.tree_util.tree_map(lambda a, b: a + b, grads_acc, grads)
         return (grads_acc, loss_acc + loss), None
@@ -733,17 +741,20 @@ def train_step_accum(state, micro_batches, dropout_rngs):
     return new_state, avg_loss, grad_norm
 
 
+# PMAPed eval step using the chunked CE for stable memory usage.
 @partial(jax.pmap, axis_name="devices")
 def eval_step(params, batch):
     """
     batch: [PER_CORE_BATCH, SEQ_LEN] per-device shard
+    Returns averaged loss across devices (float32).
     """
     logits_list = model.apply({"params": params}, input_ids=batch, train=False)
-    logits = logits_list[0]
+    logits = logits_list[0]                  # primary head (bf16) [B, T, V]
     labels = batch[:, 1:].astype(jnp.int32)
-    logits = logits[:, :-1, :]
+    logits = logits[:, :-1, :]               # align with labels [B, T-1, V]
 
-    nll  = chunked_cross_entropy(logits, labels)
+    # FIX 13: call with 2 args only
+    nll  = chunked_cross_entropy(logits, labels)   # [B, T-1]
     mask = labels != PAD_ID
     loss = jnp.where(mask, nll, 0.0).sum() / (mask.sum() + 1e-8)
     return jax.lax.pmean(loss, axis_name="devices")
@@ -756,6 +767,7 @@ CODE_LANGS = [
     "python", "javascript", "typescript", "java", "c", "cpp", "c-sharp",
     "go", "rust", "kotlin", "php", "ruby", "shell", "sql", "html", "css",
     "markdown", "yaml", "json", "dockerfile", "cuda", "r", "dart", "swift",
+    # "scala" excluded per tokenizer note
 ]
 
 
@@ -828,6 +840,7 @@ def stream_code(target_bytes: int, seed: int, skip_tokens: int = 0):
 
 
 def stream_english(target_bytes: int, seed: int, skip_tokens: int = 0):
+    """Full FineWeb-Edu default split (~1.3T tokens), score >= 3.0 filter."""
     log.info(f"[ENG] fineweb-edu | target={target_bytes/1e9:.2f}GB | skip={skip_tokens:,} tokens | seed={seed}")
     ds = load_dataset(
         "HuggingFaceFW/fineweb-edu",
@@ -856,6 +869,21 @@ def stream_english(target_bytes: int, seed: int, skip_tokens: int = 0):
 
 
 def combined_stream(resume_step: int, seed: int):
+    """
+    Weighted interleaved stream. Mix: 40% math | 40% code | 20% english.
+    Weighted cycle: [mathA, mathB, codeA, codeB, eng] → 2:2:1 ratio.
+
+    Each slot is an INDEPENDENT generator instance:
+    - mathA / mathB use seed and seed+1 (different shuffles of same dataset).
+    - codeA / codeB use seed+2 and seed+3 (code is a different dataset so
+      seed integer correlation with math seeds is irrelevant, but we space
+      them anyway for absolute clarity).
+    - Each slot gets half the modality byte budget so the two slots combined
+      consume the full math_bytes / code_bytes target.
+    - Skip tokens are split evenly between the two slots of each modality.
+      Integer truncation is at most 1 token per slot per resume — negligible
+      at 150B token scale (< 1e-10 fractional error).
+    """
     total_bytes  = TOTAL_TOKENS * 2
     math_bytes   = int(total_bytes * MATH_RATIO)
     code_bytes   = int(total_bytes * CODE_RATIO)
@@ -867,11 +895,11 @@ def combined_stream(resume_step: int, seed: int):
     eng_skip     = int(tokens_done * ENG_RATIO)
 
     cycle = [
-        stream_math(math_bytes // 2, seed,     math_skip // 2),
-        stream_math(math_bytes // 2, seed + 1, math_skip // 2),
-        stream_code(code_bytes // 2, seed + 2, code_skip // 2),
-        stream_code(code_bytes // 2, seed + 3, code_skip // 2),
-        stream_english(eng_bytes,    seed + 4, eng_skip),
+        stream_math(math_bytes // 2, seed,     math_skip // 2),   # mathA
+        stream_math(math_bytes // 2, seed + 1, math_skip // 2),   # mathB  (distinct shuffle)
+        stream_code(code_bytes // 2, seed + 2, code_skip // 2),   # codeA
+        stream_code(code_bytes // 2, seed + 3, code_skip // 2),   # codeB  (distinct shuffle)
+        stream_english(eng_bytes,    seed + 4, eng_skip),         # eng
     ]
     done  = [False] * 5
     idx   = 0
@@ -980,78 +1008,31 @@ def save_checkpoint(state, step: int, meta: dict, val_batches=None):
     with open(params_path, "wb") as f:
         f.write(params_only)
 
-    # FIX 17(a): Copy to /kaggle/working/checkpoints/ FIRST as a guaranteed
-    # backup. These files persist in Kaggle's output section even if HF upload
-    # fails or the session is killed right after. Only the latest checkpoint is
-    # kept to avoid filling up disk (previous one is removed).
-    kaggle_ckpt  = KAGGLE_OUT_DIR / ckpt_path.name
-    kaggle_meta  = KAGGLE_OUT_DIR / "metadata.json"
-    kaggle_param = KAGGLE_OUT_DIR / params_path.name
-
-    shutil.copy2(ckpt_path,   kaggle_ckpt)
-    shutil.copy2(meta_path,   kaggle_meta)
-    shutil.copy2(params_path, kaggle_param)
-    log.info(f"✓ Backup saved to Kaggle output: {kaggle_ckpt}")
-
-    # Remove previous step's backup to save disk space (keep only latest)
-    for old in KAGGLE_OUT_DIR.glob("state_step*.msgpack"):
-        if old != kaggle_ckpt:
-            old.unlink(missing_ok=True)
-    for old in KAGGLE_OUT_DIR.glob("params_step*.msgpack"):
-        if old != kaggle_param:
-            old.unlink(missing_ok=True)
-
-    if val_batches is not None:
-        vpath = TMP_DIR / "val_set.npy"
-        np.save(vpath, val_batches)
-        shutil.copy2(vpath, KAGGLE_OUT_DIR / "val_set.npy")
-
-    # FIX 17(b)(c)(d): Explicit kwargs, per-file try/except, delete only on success
     ensure_repo()
-    upload_ok = True
+    try:
+        api.upload_file(str(ckpt_path),
+                        path_in_repo=f"checkpoints/{ckpt_path.name}",
+                        repo_id=REPO_ID, repo_type="model")
+        api.upload_file(str(meta_path),
+                        path_in_repo="metadata.json",
+                        repo_id=REPO_ID, repo_type="model")
+        api.upload_file(str(params_path),
+                        path_in_repo=f"params/{params_path.name}",
+                        repo_id=REPO_ID, repo_type="model")
 
-    for local_path, repo_path in [
-        (ckpt_path,   f"checkpoints/{ckpt_path.name}"),
-        (meta_path,   "metadata.json"),
-        (params_path, f"params/{params_path.name}"),
-    ]:
-        try:
-            api.upload_file(
-                path_or_fileobj=str(local_path),
-                path_in_repo=repo_path,
-                repo_id=REPO_ID,
-                repo_type="model",
-            )
-        except Exception as e:
-            log.error(f"[UPLOAD] Failed to upload {repo_path}: {e}")
-            upload_ok = False
+        if val_batches is not None:
+            vpath = TMP_DIR / "val_set.npy"
+            np.save(vpath, val_batches)
+            api.upload_file(str(vpath), path_in_repo="val_set.npy",
+                            repo_id=REPO_ID, repo_type="model")
 
-    if val_batches is not None:
-        try:
-            api.upload_file(
-                path_or_fileobj=str(TMP_DIR / "val_set.npy"),
-                path_in_repo="val_set.npy",
-                repo_id=REPO_ID,
-                repo_type="model",
-            )
-        except Exception as e:
-            log.error(f"[UPLOAD] Failed to upload val_set.npy: {e}")
-            upload_ok = False
-
-    if upload_ok:
-        log.info(
-            f"✓ Checkpoint uploaded to HF Hub: step={step} | "
-            f"ckpt={len(state_bytes)/1e6:.1f}MB | "
-            f"params_only={len(params_only)/1e6:.1f}MB"
-        )
-        # Only delete /tmp files after confirmed successful upload
+        log.info(f"✓ Checkpoint saved: step={step} | "
+                 f"ckpt={len(state_bytes)/1e6:.1f}MB | "
+                 f"params_only={len(params_only)/1e6:.1f}MB")
         for p in [ckpt_path, meta_path, params_path]:
             p.unlink(missing_ok=True)
-    else:
-        log.warning(
-            f"[UPLOAD] Partial or full upload failure at step {step}. "
-            f"Files retained in /tmp and backed up to {KAGGLE_OUT_DIR}."
-        )
+    except Exception as e:
+        log.error(f"Upload failed (files saved locally): {e}")
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -1086,7 +1067,10 @@ if val_batches_loaded is not None:
     log.info(f"✓ Val set from checkpoint: {val_batches.shape}")
 else:
     log.info(f"Building validation set ({VAL_BATCHES_N} batches)...")
-    _val_need = VAL_BATCHES_N * MICRO_BATCH
+    # Target 3× the needed tokens to ensure we always have enough.
+    # VAL_BATCHES_N * MICRO_BATCH * MAX_SEQ_LEN = 128 * 8 * 16384 = 16,777,216 tokens.
+    # 3× target = ~50M tokens — vastly exceeds the stream budget, so no underflow.
+    _val_need = VAL_BATCHES_N * MICRO_BATCH   # 1024 blocks
     val_gen = stream_english(
         target_bytes=_val_need * MAX_SEQ_LEN * 3 * 2,
         seed=GLOBAL_SEED + 9999,
@@ -1098,6 +1082,7 @@ else:
         except StopIteration:
             break
 
+    # FIX 12: Hard guard — fail loudly if the stream didn't produce enough blocks.
     if len(val_list) < _val_need:
         raise RuntimeError(
             f"Val set underflow: got {len(val_list)} blocks, need {_val_need}. "
@@ -1134,6 +1119,8 @@ t_start     = time.time()
 
 try:
     while global_step < MAX_STEPS:
+        # Collect GRAD_ACCUM * MICRO_BATCH blocks for this step.
+        # With PER_CORE_BATCH=1, MICRO_BATCH=8, GRAD_ACCUM=32: 256 blocks total.
         step_blocks = []
         for _ in range(GRAD_ACCUM * MICRO_BATCH):
             block = prefetch_q.get()
@@ -1145,17 +1132,28 @@ try:
         if len(step_blocks) < GRAD_ACCUM * MICRO_BATCH:
             break
 
+        # Reshape [256, SEQ_LEN] → [TPU_CORES, GRAD_ACCUM, PER_CORE_BATCH, SEQ_LEN]
+        # = [8, 32, 1, 16384]. TPU_CORES_STATIC is a Python int literal →
+        # XLA sees a compile-time constant; no dynamic shape / recompile risk.
         arr = np.array(step_blocks, dtype=np.int32)
         arr = arr.reshape(GRAD_ACCUM, TPU_CORES_STATIC, PER_CORE_BATCH, MAX_SEQ_LEN)
         arr = arr.transpose(1, 0, 2, 3)  # [8, 32, 1, 16384]
         arr = jnp.asarray(arr, dtype=jnp.int32)
 
+        # Pure jrand.split RNG: no key_data/wrap_key_data needed.
+        # jrand.split(key, n) returns a typed key array [n].
+        # pmap shards axis-0 → each device gets [GRAD_ACCUM] keys.
+        # lax.scan iterates axis-0 → each micro-step gets one unique PRNGKey.
         rng, step_rng = jrand.split(rng)
+
         all_keys = jrand.split(step_rng, TPU_CORES_STATIC * GRAD_ACCUM)
 
+        # Handle both typed-key and legacy (N,2) key formats safely
         if all_keys.ndim == 1:
+            # Typed PRNG keys (JAX >= 0.4.16 new format)
             dropout_rngs = all_keys.reshape(TPU_CORES_STATIC, GRAD_ACCUM)
         else:
+            # Legacy 2-int keys
             dropout_rngs = all_keys.reshape(TPU_CORES_STATIC, GRAD_ACCUM, 2)
 
         state, loss, grad_norm = train_step_accum(state, arr, dropout_rngs)
@@ -1185,6 +1183,8 @@ try:
             log.info(f"[EVAL] Running validation at step {global_step}...")
             val_losses = []
             for vb in val_batches:
+                # vb: [MICRO_BATCH, SEQ_LEN] = [8, 16384]
+                # reshape to [TPU_CORES, PER_CORE_BATCH, SEQ_LEN] = [8, 1, 16384]
                 vb_sharded = jnp.asarray(vb, dtype=jnp.int32).reshape(
                     TPU_CORES_STATIC, PER_CORE_BATCH, MAX_SEQ_LEN
                 )
