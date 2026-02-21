@@ -1,12 +1,12 @@
 # ╔══════════════════════════════════════════════════════════════════════════════╗
 # ║   ZENYX-V2 PRETRAINING  —  TPU v5e-8  |  JAX/Flax  |  Pure BF16           ║
-# ║   Architecture: Nano-Titan | ~280M params | 16k context                    ║
+# ║   Architecture: Nano-Titan | ~280M params | 8k context                     ║
 # ║   Tokenizer: Arko007/zenyx-v2-tokenizer | vocab=32,768                     ║
 # ║   Data: FineMath-3+ (40%) + StarCoderData (40%) + FineWeb-Edu (20%)        ║
 # ║   Depth: 8 unique blocks × 4 recurrences = 32 effective layers             ║
 # ║   Attention: MLA (Multi-head Latent Attention) — 4.5× KV memory saving     ║
 # ║   FFN: CausalConvSwiGLU (strictly causal depthwise conv + SwiGLU gate)     ║
-# ║   Position: YaRN-scaled RoPE (native 16k context)                          ║
+# ║   Position: YaRN-scaled RoPE (native 8k context)                           ║
 # ║   Prediction: MTP (t+1, t+2, t+3 simultaneously)                           ║
 # ║   Optimizer: AdamW + WSD schedule (Warmup→Stable→Cosine Decay)             ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
@@ -33,14 +33,17 @@
 # Fix 15 [CRITICAL] stream_math/code/english: slow manual token-skip → .skip(n).
 # Fix 16 [INFO]     HF_TOKEN fallback uses placeholder — replace manually.
 # ── FIXES (v2.6) ──────────────────────────────────────────────────────────────
-# Fix 17 [CRITICAL] Training loop collected only GRAD_ACCUM=32 blocks of shape
-#         [SEQ_LEN], giving np.stack → [32, 9216]. Reshape to (32,8,1,9216)
-#         needs size 2,359,296 but got 294,912 → TypeError.
-#         Fix: collect BLOCKS_PER_STEP = GRAD_ACCUM * MICRO_BATCH = 256 blocks.
-#           stack  → [256, SEQ_LEN]
-#           reshape→ [GRAD_ACCUM, MICRO_BATCH, SEQ_LEN] = [32, 8, 9216]
-#           reshape→ [GRAD_ACCUM, TPU_CORES, PER_CORE_BATCH, SEQ_LEN]
-#           transpose→[TPU_CORES, GRAD_ACCUM, PER_CORE_BATCH, SEQ_LEN] = [8,32,1,9216] ✓
+# Fix 17 [CRITICAL] Training loop collected only GRAD_ACCUM=32 blocks →
+#         collect BLOCKS_PER_STEP=256 blocks, reshape correctly. ✓
+# ── FIXES (v2.7) ──────────────────────────────────────────────────────────────
+# Fix 18 [CRITICAL] RESOURCE_EXHAUSTED: 14.10G needed > 13.83G free on TPU v5e.
+#         Root: Fix 17 now correctly loads full 256-seq batch; actual HBM
+#         usage became visible. MAX_SEQ_LEN 9216 → 8192 (~11% reduction)
+#         brings peak usage well under 13.83G limit.
+# Fix 18b [MEDIUM]  Val set loaded from checkpoint had shape (128,8,9216).
+#         With new MAX_SEQ_LEN=8192 the eval reshape would crash.
+#         Guard added: if loaded val_set seq_len != MAX_SEQ_LEN, discard
+#         and regenerate automatically.
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -130,7 +133,7 @@ HEAD_DIM        = D_MODEL // N_HEADS   # 64
 MLP_HIDDEN      = 1536
 N_UNIQUE_BLOCKS = 8
 N_RECURRENCES   = 4
-MAX_SEQ_LEN     = 9_216
+MAX_SEQ_LEN     = 8_192   # FIX 18: was 9216, reduced to fit TPU v5e 16GB HBM
 DROPOUT_RATE    = 0.0
 
 MLA_KV_LATENT   = 128
@@ -155,15 +158,13 @@ PER_CORE_BATCH  = 1
 MICRO_BATCH     = PER_CORE_BATCH * TPU_CORES   # 8
 GRAD_ACCUM      = 32
 GLOBAL_BATCH    = MICRO_BATCH * GRAD_ACCUM     # 256
-
-# FIX 17: total blocks needed per optimizer step
-BLOCKS_PER_STEP = GRAD_ACCUM * MICRO_BATCH     # 32 * 8 = 256
+BLOCKS_PER_STEP = GRAD_ACCUM * MICRO_BATCH     # 256
 
 log.info(f"TPU Cores: {TPU_CORES} | Per-core batch: {PER_CORE_BATCH} | "
          f"Micro-batch: {MICRO_BATCH} | Grad-accum: {GRAD_ACCUM} | "
          f"Global batch: {GLOBAL_BATCH} seqs/step")
 log.info(f"Tokens/step: {GLOBAL_BATCH * MAX_SEQ_LEN / 1e6:.2f}M")
-log.info(f"Estimated per-chip HBM peak: ~13.7 GB / 16 GB")
+log.info(f"Estimated per-chip HBM peak: ~12.2 GB / 16 GB")
 
 # ── Optimizer / Schedule ──────────────────────────────────────────────────────
 LEARNING_RATE = 3e-4
@@ -928,11 +929,19 @@ best_val_loss = meta.get("best_val_loss", float("inf")) if meta else float("inf"
 # ════════════════════════════════════════════════════════════════════════════════
 # §14  VALIDATION SET
 # ════════════════════════════════════════════════════════════════════════════════
+# FIX 18b: discard val set if seq_len doesn't match current MAX_SEQ_LEN
+if val_batches_loaded is not None and val_batches_loaded.shape[2] != MAX_SEQ_LEN:
+    log.warning(
+        f"Val set seq_len {val_batches_loaded.shape[2]} != MAX_SEQ_LEN {MAX_SEQ_LEN}. "
+        f"Discarding and regenerating."
+    )
+    val_batches_loaded = None
+
 if val_batches_loaded is not None:
     val_batches = val_batches_loaded
     log.info(f"✓ Val set from checkpoint: {val_batches.shape}")
 else:
-    log.info(f"Creating val set ({VAL_BATCHES_N} batches)...")
+    log.info(f"Creating val set ({VAL_BATCHES_N} batches × {MICRO_BATCH} seqs × {MAX_SEQ_LEN} tokens)...")
     val_gen  = stream_english(int(TOTAL_TOKENS * ENG_RATIO * 2), GLOBAL_SEED + 99, skip_tokens=0)
     val_list = []
     for block in val_gen:
@@ -978,11 +987,8 @@ train_losses = []
 
 try:
     while global_step < MAX_STEPS:
-        # ── FIX 17: collect GRAD_ACCUM * MICRO_BATCH = 256 raw blocks ────────
-        # Each block from combined_stream is one sequence: [SEQ_LEN]
-        # We need GLOBAL_BATCH = 256 sequences total per optimizer step.
         raw_blocks = []
-        for _ in range(BLOCKS_PER_STEP):    # 256 iterations
+        for _ in range(BLOCKS_PER_STEP):
             block = prefetch_q.get()
             if block is None:
                 break
@@ -992,19 +998,14 @@ try:
             log.info("Dataset exhausted.")
             break
 
-        # [256, SEQ_LEN]
-        mb_np = np.stack(raw_blocks, axis=0)
-        # [GRAD_ACCUM, MICRO_BATCH, SEQ_LEN] = [32, 8, 9216]
-        mb_np = mb_np.reshape(GRAD_ACCUM, MICRO_BATCH, MAX_SEQ_LEN)
-        # [GRAD_ACCUM, TPU_CORES, PER_CORE_BATCH, SEQ_LEN] = [32, 8, 1, 9216]
+        mb_np  = np.stack(raw_blocks, axis=0)                              # [256, SEQ_LEN]
+        mb_np  = mb_np.reshape(GRAD_ACCUM, MICRO_BATCH, MAX_SEQ_LEN)      # [32, 8, 8192]
         mb_jax = jnp.array(mb_np, dtype=jnp.int32)
-        mb_jax = mb_jax.reshape(GRAD_ACCUM, TPU_CORES, PER_CORE_BATCH, MAX_SEQ_LEN)
-        # [TPU_CORES, GRAD_ACCUM, PER_CORE_BATCH, SEQ_LEN] = [8, 32, 1, 9216]
-        mb_jax = mb_jax.transpose(1, 0, 2, 3)
+        mb_jax = mb_jax.reshape(GRAD_ACCUM, TPU_CORES, PER_CORE_BATCH, MAX_SEQ_LEN)  # [32,8,1,8192]
+        mb_jax = mb_jax.transpose(1, 0, 2, 3)                             # [8, 32, 1, 8192]
 
-        # dropout RNGs: [TPU_CORES, GRAD_ACCUM, 2]
         rng, *sub_rngs = jrand.split(rng, 1 + TPU_CORES * GRAD_ACCUM)
-        dropout_rngs = jnp.array(sub_rngs).reshape(TPU_CORES, GRAD_ACCUM, -1)
+        dropout_rngs   = jnp.array(sub_rngs).reshape(TPU_CORES, GRAD_ACCUM, -1)
 
         state, loss, grad_norm = train_step_accum(state, mb_jax, dropout_rngs)
 
@@ -1024,11 +1025,10 @@ try:
 
         global_step += 1
 
-        # ── eval + checkpoint ─────────────────────────────────────────────────
         if global_step % EVAL_EVERY == 0:
             log.info(f"Evaluating at step {global_step}...")
             val_loss_list = []
-            for vb in val_batches:   # vb: [MICRO_BATCH, SEQ_LEN]
+            for vb in val_batches:
                 vb_jax = jnp.array(vb, dtype=jnp.int32).reshape(
                     TPU_CORES, PER_CORE_BATCH, MAX_SEQ_LEN
                 )
