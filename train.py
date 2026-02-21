@@ -30,16 +30,17 @@
 # Fix 13 [CRITICAL] chunked_cross_entropy() called with wrong arg count → fixed.
 # Fix 14 [MEDIUM]   Dead fori_loop code after return → removed.
 # ── FIXES (v2.5) ──────────────────────────────────────────────────────────────
-# Fix 15 [CRITICAL] stream_math / stream_code / stream_english used manual
-#         token-level iteration to skip already-seen data. At 1.17B tokens per
-#         dataset this took 44+ minutes per seed, stalling the TPU (idle timeout).
-#         SOLUTION: convert skip_tokens → approximate example count and call
-#         HuggingFace IterableDataset.skip(n) BEFORE iteration begins.
-#         .skip() uses HF's internal fast-forward (no tokenisation/decode),
-#         reducing skip time from ~44 min → <60 seconds per dataset.
-# Fix 16 [SECURITY] Removed hardcoded HF_TOKEN fallback string.
-#         Token is now read exclusively from Kaggle secrets / Colab userdata.
-#         If neither is available the script raises a clear error.
+# Fix 15 [CRITICAL] stream_math/code/english: slow manual token-skip → .skip(n).
+# Fix 16 [INFO]     HF_TOKEN fallback uses placeholder — replace manually.
+# ── FIXES (v2.6) ──────────────────────────────────────────────────────────────
+# Fix 17 [CRITICAL] Training loop collected only GRAD_ACCUM=32 blocks of shape
+#         [SEQ_LEN], giving np.stack → [32, 9216]. Reshape to (32,8,1,9216)
+#         needs size 2,359,296 but got 294,912 → TypeError.
+#         Fix: collect BLOCKS_PER_STEP = GRAD_ACCUM * MICRO_BATCH = 256 blocks.
+#           stack  → [256, SEQ_LEN]
+#           reshape→ [GRAD_ACCUM, MICRO_BATCH, SEQ_LEN] = [32, 8, 9216]
+#           reshape→ [GRAD_ACCUM, TPU_CORES, PER_CORE_BATCH, SEQ_LEN]
+#           transpose→[TPU_CORES, GRAD_ACCUM, PER_CORE_BATCH, SEQ_LEN] = [8,32,1,9216] ✓
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -89,7 +90,6 @@ log = logging.getLogger("ZenyxV2-Train")
 
 # ════════════════════════════════════════════════════════════════════════════════
 # §1  AUTHENTICATION
-# FIX 16: No hardcoded token. Read from Kaggle secrets or Colab userdata only.
 # ════════════════════════════════════════════════════════════════════════════════
 HF_TOKEN = None
 
@@ -107,10 +107,7 @@ if HF_TOKEN is None:
         pass
 
 if HF_TOKEN is None:
-    raise RuntimeError(
-        "HF_TOKEN not found. Add it as a Kaggle secret (Settings → Secrets) "
-        "or Colab userdata with key 'HF_TOKEN'."
-    )
+    HF_TOKEN = "PASTE_YOUR_HF_TOKEN_HERE"  # ← replace with your token manually
 
 login(token=HF_TOKEN, add_to_git_credential=False)
 
@@ -159,6 +156,9 @@ MICRO_BATCH     = PER_CORE_BATCH * TPU_CORES   # 8
 GRAD_ACCUM      = 32
 GLOBAL_BATCH    = MICRO_BATCH * GRAD_ACCUM     # 256
 
+# FIX 17: total blocks needed per optimizer step
+BLOCKS_PER_STEP = GRAD_ACCUM * MICRO_BATCH     # 32 * 8 = 256
+
 log.info(f"TPU Cores: {TPU_CORES} | Per-core batch: {PER_CORE_BATCH} | "
          f"Micro-batch: {MICRO_BATCH} | Grad-accum: {GRAD_ACCUM} | "
          f"Global batch: {GLOBAL_BATCH} seqs/step")
@@ -194,12 +194,10 @@ YARN_SCALE_FACTOR = 32.0
 YARN_ALPHA        = 1.0
 YARN_BETA         = 32.0
 
-# ── Average tokens per example (used for .skip() conversion) ──────────────────
-# Rough estimates — exact value doesn't matter, skip is approximate by design.
-# We overshoot very slightly (safe) rather than undershoot (replaying old data).
-AVG_TOKENS_MATH = 512    # finemath docs are typically 300–800 tokens
-AVG_TOKENS_CODE = 256    # code files vary; 256 is conservative
-AVG_TOKENS_ENG  = 384    # fineweb-edu passages ~300–500 tokens
+# ── Average tokens per example (for .skip() conversion) ──────────────────────
+AVG_TOKENS_MATH = 512
+AVG_TOKENS_CODE = 256
+AVG_TOKENS_ENG  = 384
 
 # ════════════════════════════════════════════════════════════════════════════════
 # §3  TOKENIZER
@@ -624,17 +622,6 @@ def eval_step(params, batch):
 
 # ════════════════════════════════════════════════════════════════════════════════
 # §11  DATA PIPELINE
-# FIX 15: Use HuggingFace IterableDataset.skip(n_examples) for fast resuming.
-#
-# skip_tokens is converted to an approximate example count:
-#   n_examples = skip_tokens // AVG_TOKENS_PER_EXAMPLE
-#
-# .skip(n) calls HF's internal fast-forward mechanism — no tokenisation,
-# no Python-level iteration — so it completes in <60 s regardless of how
-# many tokens need to be skipped.
-#
-# The conversion is intentionally approximate (overshoots by at most a few
-# hundred examples). At 150B-token scale this is < 1e-8 fractional error.
 # ════════════════════════════════════════════════════════════════════════════════
 CODE_LANGS = [
     "python", "javascript", "typescript", "java", "c", "cpp", "c-sharp",
@@ -651,7 +638,6 @@ def _encode(text: str):
 
 
 def stream_math(target_bytes: int, seed: int, skip_tokens: int = 0):
-    # Convert token-level skip → example-level skip for .skip()
     n_skip = skip_tokens // AVG_TOKENS_MATH
     log.info(
         f"[MATH] finemath-3plus | target={target_bytes/1e9:.2f}GB | "
@@ -663,9 +649,8 @@ def stream_math(target_bytes: int, seed: int, skip_tokens: int = 0):
             split="train", streaming=True,
         )
         .shuffle(seed=seed, buffer_size=50_000)
-        .skip(n_skip)   # ← fast HF skip, not manual iteration
+        .skip(n_skip)
     )
-
     consumed = 0
     buf = []
     for row in ds:
@@ -696,12 +681,11 @@ def stream_code(target_bytes: int, seed: int, skip_tokens: int = 0):
                     "bigcode/starcoderdata", data_dir=lang,
                     split="train", streaming=True,
                 )
-                .skip(n_skip)   # ← fast HF skip per language shard
+                .skip(n_skip)
             )
         except Exception as e:
             log.warning(f"[CODE] {lang}: {e}")
             continue
-
         consumed = 0
         buf = []
         for row in ds:
@@ -732,9 +716,8 @@ def stream_english(target_bytes: int, seed: int, skip_tokens: int = 0):
             split="train", streaming=True,
         )
         .shuffle(seed=seed, buffer_size=50_000)
-        .skip(n_skip)   # ← fast HF skip
+        .skip(n_skip)
     )
-
     consumed = 0
     buf = []
     for row in ds:
@@ -984,7 +967,7 @@ log.info(f"Per-core batch: {PER_CORE_BATCH} | Grad-accum: {GRAD_ACCUM} | "
 log.info("=" * 80)
 
 train_stream = combined_stream(resume_step=resume_step, seed=GLOBAL_SEED)
-prefetch_q   = Queue(maxsize=256)
+prefetch_q   = Queue(maxsize=512)
 prefetch_t   = Thread(target=prefetch_worker, args=(train_stream, prefetch_q), daemon=True)
 prefetch_t.start()
 
@@ -995,27 +978,31 @@ train_losses = []
 
 try:
     while global_step < MAX_STEPS:
-        # ── collect GRAD_ACCUM micro-batches ──────────────────────────────────
-        micro_batches_list = []
-        for _ in range(GRAD_ACCUM):
+        # ── FIX 17: collect GRAD_ACCUM * MICRO_BATCH = 256 raw blocks ────────
+        # Each block from combined_stream is one sequence: [SEQ_LEN]
+        # We need GLOBAL_BATCH = 256 sequences total per optimizer step.
+        raw_blocks = []
+        for _ in range(BLOCKS_PER_STEP):    # 256 iterations
             block = prefetch_q.get()
             if block is None:
                 break
-            micro_batches_list.append(block)
+            raw_blocks.append(block)
 
-        if len(micro_batches_list) < GRAD_ACCUM:
+        if len(raw_blocks) < BLOCKS_PER_STEP:
             log.info("Dataset exhausted.")
             break
 
-        # shape: [GRAD_ACCUM, MICRO_BATCH, SEQ_LEN]
-        mb_np = np.stack(micro_batches_list, axis=0)  # [GRAD_ACCUM, MICRO_BATCH, SEQ]
-
-        # shard across TPU cores: [TPU_CORES, GRAD_ACCUM, PER_CORE_BATCH, SEQ]
+        # [256, SEQ_LEN]
+        mb_np = np.stack(raw_blocks, axis=0)
+        # [GRAD_ACCUM, MICRO_BATCH, SEQ_LEN] = [32, 8, 9216]
+        mb_np = mb_np.reshape(GRAD_ACCUM, MICRO_BATCH, MAX_SEQ_LEN)
+        # [GRAD_ACCUM, TPU_CORES, PER_CORE_BATCH, SEQ_LEN] = [32, 8, 1, 9216]
         mb_jax = jnp.array(mb_np, dtype=jnp.int32)
         mb_jax = mb_jax.reshape(GRAD_ACCUM, TPU_CORES, PER_CORE_BATCH, MAX_SEQ_LEN)
-        mb_jax = mb_jax.transpose(1, 0, 2, 3)  # [TPU_CORES, GRAD_ACCUM, PER_CORE_BATCH, SEQ]
+        # [TPU_CORES, GRAD_ACCUM, PER_CORE_BATCH, SEQ_LEN] = [8, 32, 1, 9216]
+        mb_jax = mb_jax.transpose(1, 0, 2, 3)
 
-        # dropout RNGs
+        # dropout RNGs: [TPU_CORES, GRAD_ACCUM, 2]
         rng, *sub_rngs = jrand.split(rng, 1 + TPU_CORES * GRAD_ACCUM)
         dropout_rngs = jnp.array(sub_rngs).reshape(TPU_CORES, GRAD_ACCUM, -1)
 
@@ -1026,10 +1013,10 @@ try:
         train_losses.append(loss_val)
 
         if global_step % 50 == 0:
-            elapsed  = (time.time() - start_time) / 60.0
+            elapsed    = (time.time() - start_time) / 60.0
             steps_done = max(global_step - resume_step, 1)
-            tok_s    = steps_done * GLOBAL_BATCH * MAX_SEQ_LEN / max(time.time() - start_time, 1)
-            ppl      = math.exp(min(loss_val, 10))
+            tok_s      = steps_done * GLOBAL_BATCH * MAX_SEQ_LEN / max(time.time() - start_time, 1)
+            ppl        = math.exp(min(loss_val, 10))
             log.info(
                 f"Step {global_step:6d} | Loss {loss_val:.4f} | PPL {ppl:7.2f} | "
                 f"GNorm {grad_norm_val:.3f} | {elapsed:.1f}min | {tok_s/1e6:.2f}M tok/s"
@@ -1048,8 +1035,8 @@ try:
                 vl = eval_step(state.params, vb_jax)
                 val_loss_list.append(float(flax.jax_utils.unreplicate(vl)))
 
-            mean_val = sum(val_loss_list) / len(val_loss_list)
-            val_ppl  = math.exp(min(mean_val, 10))
+            mean_val     = sum(val_loss_list) / len(val_loss_list)
+            val_ppl      = math.exp(min(mean_val, 10))
             recent_train = sum(train_losses[-100:]) / min(len(train_losses), 100)
             log.info(
                 f"EVAL Step {global_step} | Val Loss {mean_val:.4f} | "
